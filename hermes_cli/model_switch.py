@@ -983,9 +983,50 @@ def switch_model(
                 error_message=msg,
             )
 
-    # Apply auto-correction if validation found a closer match
+    # Apply auto-correction if validation found a closer match — but only
+    # if the user hasn't explicitly declared the original model in their
+    # provider config. When `discover_models: false` and the model is listed
+    # in `providers.<slug>.models`, the user is telling us to trust their
+    # declaration over the live /v1/models probe (the backend may serve
+    # hidden/aliased models it doesn't advertise). Auto-correcting away
+    # their explicit choice in that case is wrong.
     if validation.get("corrected_model"):
-        new_model = validation["corrected_model"]
+        original_model = new_model
+        user_declared = False
+        if user_providers:
+            for slug, cfg in user_providers.items():
+                if slug != target_provider:
+                    continue
+                cfg_models = cfg.get("models", {})
+                if original_model in cfg_models:
+                    user_declared = True
+                    break
+                if isinstance(cfg_models, list):
+                    if any(m.get("name") == original_model for m in cfg_models if isinstance(m, dict)):
+                        user_declared = True
+                        break
+        if not user_declared and custom_providers and isinstance(custom_providers, list):
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                entry_name = entry.get("name", "")
+                entry_slug = f"custom:{entry_name}" if entry_name else ""
+                entry_url = entry.get("base_url", "")
+                if entry_slug != target_provider and entry_url != base_url:
+                    continue
+                entry_model = entry.get("model", "")
+                entry_models = entry.get("models", {})
+                if original_model == entry_model or (
+                    isinstance(entry_models, dict) and original_model in entry_models
+                ):
+                    user_declared = True
+                    break
+        if user_declared:
+            # Trust the user's explicit declaration; drop the auto-correction
+            # but keep any non-correction message (e.g. recognition note).
+            validation.pop("corrected_model", None)
+        else:
+            new_model = validation["corrected_model"]
 
     # --- Copilot api_mode override ---
     if target_provider in {"copilot", "github-copilot"}:

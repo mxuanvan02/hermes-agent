@@ -568,3 +568,112 @@ def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch)
         "gateway-model-c",
     ], "Live models must replace the static subset"
     assert gateway_prov["total_models"] == 3
+
+
+def test_switch_model_user_declared_model_skips_auto_correct(monkeypatch):
+    """When a model is explicitly listed in ``providers.<slug>.models`` but
+    absent from the live /v1/models listing (backend serves it without
+    advertising it), switch_model must NOT auto-correct it away.
+
+    Regression: the auto-correct path returned ``accepted: True`` with a
+    ``corrected_model``, so the user-config override (gated behind
+    ``not accepted``) was skipped and the user's explicit declaration was
+    silently replaced by a fuzzy match.
+    """
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "sk-test",
+            "base_url": "http://localhost:8080/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "corrected_model": "claude-sonnet-4.5",
+            "message": "Auto-corrected `claude-sonnet-5` → `claude-sonnet-4.5`",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="claude-sonnet-5",
+        current_provider="superkiro",
+        current_model="claude-opus-4.8",
+        current_base_url="http://localhost:8080/v1",
+        current_api_key="sk-test",
+        user_providers={
+            "superkiro": {
+                "base_url": "http://localhost:8080/v1",
+                "api_key": "sk-test",
+                "api_mode": "openai",
+                "discover_models": False,
+                "models": {
+                    "claude-opus-4.8": {"context_length": 1000000},
+                    "claude-sonnet-5": {"context_length": 1000000},
+                },
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert result.new_model == "claude-sonnet-5", (
+        "User-declared model must not be auto-corrected to a fuzzy match"
+    )
+
+
+def test_switch_model_undeclared_model_still_auto_corrects(monkeypatch):
+    """Models NOT declared in the user's provider config should still be
+    auto-corrected — the override only protects explicit declarations."""
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "sk-test",
+            "base_url": "http://localhost:8080/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "corrected_model": "claude-sonnet-4.5",
+            "message": "Auto-corrected `claude-sonet-5` → `claude-sonnet-4.5`",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="claude-sonet-5",  # typo, not declared anywhere
+        current_provider="superkiro",
+        current_model="claude-opus-4.8",
+        current_base_url="http://localhost:8080/v1",
+        current_api_key="sk-test",
+        user_providers={
+            "superkiro": {
+                "base_url": "http://localhost:8080/v1",
+                "api_key": "sk-test",
+                "api_mode": "openai",
+                "discover_models": False,
+                "models": {
+                    "claude-opus-4.8": {"context_length": 1000000},
+                    "claude-sonnet-5": {"context_length": 1000000},
+                },
+            }
+        },
+        custom_providers=[],
+    )
+
+    assert result.success is True
+    assert result.new_model == "claude-sonnet-4.5", (
+        "Undeclared model should still be auto-corrected"
+    )
