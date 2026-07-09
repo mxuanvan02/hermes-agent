@@ -32,9 +32,11 @@ import base64
 import json
 import logging
 import os
+import shutil
+import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Dict, Optional
+from typing import Any, Awaitable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
@@ -72,6 +74,10 @@ _VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
 # Hard cap on downloaded image file size (50 MB). Prevents OOM from
 # attacker-hosted multi-gigabyte files or decompression bombs.
 _VISION_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+_PDF_DEFAULT_MAX_PAGES = 3
+_PDF_HARD_MAX_PAGES = 10
+_PDF_RENDER_DPI = 150
 
 
 def _validate_image_url(url: str) -> bool:
@@ -125,6 +131,195 @@ def _detect_image_mime_type(image_path: Path) -> Optional[str]:
         if "<svg" in head:
             return "image/svg+xml"
     return None
+
+
+def _is_pdf_file(file_path: Path) -> bool:
+    """Return True when the local file has a real PDF header."""
+    try:
+        with file_path.open("rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def _parse_pdf_pages(
+    pages: Optional[str],
+    page_count: int,
+    max_pages: int = _PDF_DEFAULT_MAX_PAGES,
+) -> List[int]:
+    """Parse 1-based page selections into 0-based page indexes.
+
+    ``pages`` accepts comma-separated page numbers and ranges such as
+    ``"1,3-5"``. An empty value selects the first ``max_pages`` pages.
+    """
+    if page_count < 1:
+        raise ValueError("PDF has no pages.")
+
+    max_pages = max(1, min(int(max_pages or _PDF_DEFAULT_MAX_PAGES), _PDF_HARD_MAX_PAGES))
+    if not pages or not str(pages).strip():
+        return list(range(min(page_count, max_pages)))
+
+    selected: List[int] = []
+    seen = set()
+    for raw_part in str(pages).split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw.strip())
+            end = int(end_raw.strip())
+            if end < start:
+                raise ValueError(f"Invalid PDF page range: {part}")
+            candidates = range(start, end + 1)
+        else:
+            candidates = (int(part),)
+
+        for one_based in candidates:
+            if one_based < 1 or one_based > page_count:
+                raise ValueError(
+                    f"PDF page {one_based} is outside the valid range 1-{page_count}."
+                )
+            zero_based = one_based - 1
+            if zero_based not in seen:
+                selected.append(zero_based)
+                seen.add(zero_based)
+            if len(selected) >= max_pages:
+                return selected
+
+    if not selected:
+        raise ValueError("No valid PDF pages selected.")
+    return selected
+
+
+def _import_fitz():
+    """Import PyMuPDF, including optional packages installed under HERMES_HOME."""
+    package_dir = os.getenv("HERMES_PYTHON_PACKAGES", "").strip()
+    if not package_dir:
+        hermes_home = os.getenv("HERMES_HOME", "").strip()
+        if hermes_home:
+            package_dir = str(Path(hermes_home) / "python-packages")
+    if package_dir and Path(package_dir).is_dir() and package_dir not in sys.path:
+        sys.path.insert(0, package_dir)
+
+    import fitz  # type: ignore[import-not-found]
+
+    return fitz
+
+
+def _get_pdf_page_count(pdf_path: Path) -> int:
+    """Read a PDF page count through PyMuPDF or pdfinfo."""
+    try:
+        fitz = _import_fitz()
+        doc = fitz.open(str(pdf_path))
+        try:
+            return int(doc.page_count)
+        finally:
+            doc.close()
+    except Exception:
+        pass
+
+    if shutil.which("pdfinfo"):
+        result = subprocess.run(
+            ["pdfinfo", str(pdf_path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        for line in result.stdout.splitlines():
+            if line.lower().startswith("pages:"):
+                return int(line.split(":", 1)[1].strip())
+
+    raise RuntimeError(
+        "PDF visual analysis requires PyMuPDF (`pip install pymupdf`) or "
+        "Poppler tools (`pdftoppm`/`pdfinfo`) to render pages."
+    )
+
+
+def _render_pdf_pages_with_pymupdf(
+    pdf_path: Path,
+    page_indexes: List[int],
+    output_dir: Path,
+) -> List[Tuple[int, Path]]:
+    """Render PDF pages using PyMuPDF when available."""
+    fitz = _import_fitz()
+
+    rendered: List[Tuple[int, Path]] = []
+    doc = fitz.open(str(pdf_path))
+    try:
+        zoom = _PDF_RENDER_DPI / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_index in page_indexes:
+            page = doc.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            output_path = output_dir / f"page-{page_index + 1}.png"
+            pixmap.save(str(output_path))
+            rendered.append((page_index + 1, output_path))
+    finally:
+        doc.close()
+    return rendered
+
+
+def _render_pdf_pages_with_pdftoppm(
+    pdf_path: Path,
+    page_indexes: List[int],
+    output_dir: Path,
+) -> List[Tuple[int, Path]]:
+    """Render PDF pages with the Poppler ``pdftoppm`` CLI."""
+    if not shutil.which("pdftoppm"):
+        raise RuntimeError("pdftoppm is not installed")
+
+    rendered: List[Tuple[int, Path]] = []
+    for page_index in page_indexes:
+        page_number = page_index + 1
+        prefix = output_dir / f"page-{page_number}"
+        subprocess.run(
+            [
+                "pdftoppm",
+                "-png",
+                "-r",
+                str(_PDF_RENDER_DPI),
+                "-f",
+                str(page_number),
+                "-l",
+                str(page_number),
+                str(pdf_path),
+                str(prefix),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
+        candidates = sorted(output_dir.glob(f"page-{page_number}-*.png"))
+        if not candidates:
+            raise RuntimeError(f"pdftoppm did not render page {page_number}")
+        rendered.append((page_number, candidates[0]))
+    return rendered
+
+
+def _render_pdf_pages_for_vision(
+    pdf_path: Path,
+    pages: Optional[str] = None,
+    max_pages: int = _PDF_DEFAULT_MAX_PAGES,
+) -> List[Tuple[int, Path]]:
+    """Render selected PDF pages to temporary PNG files for vision analysis."""
+    page_count = _get_pdf_page_count(pdf_path)
+    page_indexes = _parse_pdf_pages(pages, page_count, max_pages=max_pages)
+    output_dir = get_hermes_dir("cache/vision", "pdf_pages") / f"pdf_{uuid.uuid4()}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        try:
+            return _render_pdf_pages_with_pymupdf(pdf_path, page_indexes, output_dir)
+        except ImportError:
+            return _render_pdf_pages_with_pdftoppm(pdf_path, page_indexes, output_dir)
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
 
 
 async def _download_image(image_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -634,6 +829,8 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    pages: str = None,
+    max_pages: int = _PDF_DEFAULT_MAX_PAGES,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -673,7 +870,9 @@ async def vision_analyze_tool(
         "parameters": {
             "image_url": image_url,
             "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
-            "model": model
+            "model": model,
+            "pages": pages,
+            "max_pages": max_pages,
         },
         "error": None,
         "success": False,
@@ -686,7 +885,9 @@ async def vision_analyze_tool(
     # Track whether we should clean up the file after processing.
     # Local files (e.g. from the image cache) should NOT be deleted.
     should_cleanup = True
+    temp_rendered_paths: List[Path] = []
     detected_mime_type = None
+    is_pdf = False
     
     try:
         from tools.interrupt import is_interrupted
@@ -704,7 +905,7 @@ async def vision_analyze_tool(
         local_path = Path(os.path.expanduser(resolved_url))
         if local_path.is_file():
             # Local file path (e.g. from platform image cache) -- skip download
-            logger.info("Using local image file: %s", image_url)
+            logger.info("Using local file: %s", image_url)
             temp_image_path = local_path
             should_cleanup = False  # Don't delete cached/local files
         elif _validate_image_url(image_url):
@@ -725,57 +926,100 @@ async def vision_analyze_tool(
         # Get image file size for logging
         image_size_bytes = temp_image_path.stat().st_size
         image_size_kb = image_size_bytes / 1024
-        logger.info("Image ready (%.1f KB)", image_size_kb)
+        logger.info("File ready (%.1f KB)", image_size_kb)
 
         detected_mime_type = _detect_image_mime_type(temp_image_path)
         if not detected_mime_type:
-            raise ValueError("Only real image files are supported for vision analysis.")
-        
-        # Convert image to base64 — send at full resolution first.
-        # If the provider rejects it as too large, we auto-resize and retry.
-        logger.info("Converting image to base64...")
-        image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
-        data_size_kb = len(image_data_url) / 1024
-        logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
-
-        # Hard limit (20 MB) — no provider accepts payloads this large.
-        if len(image_data_url) > _MAX_BASE64_BYTES:
-            # Try to resize down to 5 MB before giving up.
-            image_data_url = _resize_image_for_vision(
-                temp_image_path, mime_type=detected_mime_type)
-            if len(image_data_url) > _MAX_BASE64_BYTES:
+            if _is_pdf_file(temp_image_path):
+                is_pdf = True
+            else:
                 raise ValueError(
-                    f"Image too large for vision API: base64 payload is "
-                    f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
-                    f"even after resizing. "
-                    f"Install Pillow (`pip install Pillow`) for better auto-resize, "
-                    f"or compress the image manually."
+                    "Only real image files or PDF documents are supported for vision analysis."
                 )
-
+        
         debug_call_data["image_size_bytes"] = image_size_bytes
-        
-        # Use the prompt as provided (model_tools.py now handles full description formatting)
-        comprehensive_prompt = user_prompt
-        
-        # Prepare the message with base64-encoded image
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": comprehensive_prompt
-                    },
+
+        if is_pdf:
+            page_pairs = _render_pdf_pages_for_vision(
+                temp_image_path, pages=pages, max_pages=max_pages
+            )
+            temp_rendered_paths = [path for _, path in page_pairs]
+            rendered_pages = ", ".join(str(page) for page, _ in page_pairs)
+            logger.info("PDF rendered pages: %s", rendered_pages)
+            content_parts = [
+                {
+                    "type": "text",
+                    "text": (
+                        "This source is a PDF document rendered into page images. "
+                        f"Inspect these pages in order: {rendered_pages}. "
+                        "Describe the document visually and answer the question.\n\n"
+                        f"Question:\n{user_prompt}"
+                    ),
+                }
+            ]
+            for page_number, rendered_path in page_pairs:
+                logger.info("Converting PDF page %s to base64...", page_number)
+                image_data_url = _resize_image_for_vision(rendered_path, mime_type="image/png")
+                if len(image_data_url) > _MAX_BASE64_BYTES:
+                    raise ValueError(
+                        f"Rendered PDF page {page_number} is too large for vision API: "
+                        f"base64 payload is {len(image_data_url) / (1024 * 1024):.1f} MB "
+                        f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB). "
+                        "Install Pillow for better auto-resize or lower the selected pages."
+                    )
+                content_parts.append({"type": "text", "text": f"PDF page {page_number}:"})
+                content_parts.append(
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": image_data_url
-                        }
+                        "image_url": {"url": image_data_url},
                     }
-                ]
-            }
-        ]
+                )
+            messages = [{"role": "user", "content": content_parts}]
+            image_data_url = ""
+        else:
+            # Convert image to base64 — send at full resolution first.
+            # If the provider rejects it as too large, we auto-resize and retry.
+            logger.info("Converting image to base64...")
+            image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
+            data_size_kb = len(image_data_url) / 1024
+            logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
+
+            # Hard limit (20 MB) — no provider accepts payloads this large.
+            if len(image_data_url) > _MAX_BASE64_BYTES:
+                # Try to resize down to 5 MB before giving up.
+                image_data_url = _resize_image_for_vision(
+                    temp_image_path, mime_type=detected_mime_type)
+                if len(image_data_url) > _MAX_BASE64_BYTES:
+                    raise ValueError(
+                        f"Image too large for vision API: base64 payload is "
+                        f"{len(image_data_url) / (1024 * 1024):.1f} MB "
+                        f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
+                        f"even after resizing. "
+                        f"Install Pillow (`pip install Pillow`) for better auto-resize, "
+                        f"or compress the image manually."
+                    )
+
+            # Use the prompt as provided (model_tools.py now handles full description formatting)
+            comprehensive_prompt = user_prompt
+
+            # Prepare the message with base64-encoded image
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": comprehensive_prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_url
+                            }
+                        }
+                    ]
+                }
+            ]
         
         logger.info("Processing image with vision model...")
         
@@ -800,7 +1044,7 @@ async def vision_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
+            "max_tokens": 3000 if is_pdf else 2000,
             "timeout": vision_timeout,
         }
         if model:
@@ -809,7 +1053,8 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if (_is_image_size_error(_api_err)
+            if (not is_pdf
+                    and _is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
                 logger.info(
                     "API rejected image (%.1f MB, likely too large); "
@@ -911,6 +1156,16 @@ async def vision_analyze_tool(
                 logger.warning(
                     "Could not delete temporary file: %s", cleanup_error, exc_info=True
                 )
+        for rendered_path in temp_rendered_paths:
+            try:
+                if rendered_path.exists():
+                    rendered_path.unlink()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Could not delete rendered PDF page file: %s",
+                    cleanup_error,
+                    exc_info=True,
+                )
 
 
 def check_vision_requirements() -> bool:
@@ -1000,25 +1255,36 @@ from tools.registry import registry, tool_error
 VISION_ANALYZE_SCHEMA = {
     "name": "vision_analyze",
     "description": (
-        "Load an image into the conversation so you can see it. Accepts a "
-        "URL, local file path, or data URL. When your active model has "
+        "Load an image or PDF into the conversation so you can see it. Accepts a "
+        "URL, local file path, PDF file path, or data URL. When your active model has "
         "native vision, the image is attached to your context directly "
         "and you read the pixels yourself on the next turn — call this "
         "any time the user references an image (filepath in their message, "
         "URL in tool output, screenshot from the browser, etc.). For "
-        "non-vision models, falls back to an auxiliary vision model that "
-        "returns a text description."
+        "PDFs and non-vision models, falls back to an auxiliary vision model that "
+        "returns a text description. For PDFs, selected pages are rendered into "
+        "images and inspected visually."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "image_url": {
                 "type": "string",
-                "description": "Image URL (http/https), local file path, or data: URL to load."
+                "description": "Image URL (http/https), local image/PDF file path, or data: URL to load."
             },
             "question": {
                 "type": "string",
                 "description": "Your specific question or request about the image. Optional context the model uses on the next turn after seeing the image."
+            },
+            "pages": {
+                "type": "string",
+                "description": "Optional PDF page selection using 1-based numbers and ranges like '1,3-5'. Defaults to the first few pages."
+            },
+            "max_pages": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Maximum number of PDF pages to render when pages is not provided."
             }
         },
         "required": ["image_url", "question"]
@@ -1029,6 +1295,14 @@ VISION_ANALYZE_SCHEMA = {
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+    pages = args.get("pages") or None
+    max_pages = args.get("max_pages")
+    if max_pages is None:
+        max_pages = _PDF_DEFAULT_MAX_PAGES
+
+    resolved_url = image_url[len("file://"):] if isinstance(image_url, str) and image_url.startswith("file://") else image_url
+    local_path = Path(os.path.expanduser(resolved_url)) if isinstance(resolved_url, str) else Path()
+    is_local_pdf = local_path.is_file() and _is_pdf_file(local_path)
 
     # Fast path: when the active main model supports native vision AND the
     # provider supports image content inside tool results, short-circuit
@@ -1044,7 +1318,11 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         _model = _read_main_model()
         _cfg = load_config()
         _mode = decide_image_input_mode(_provider, _model, _cfg)
-        if _mode == "native" and _supports_media_in_tool_results(_provider, _model):
+        if (
+            not is_local_pdf
+            and _mode == "native"
+            and _supports_media_in_tool_results(_provider, _model)
+        ):
             logger.info(
                 "vision_analyze: native fast path (provider=%s, model=%s)",
                 _provider, _model,
@@ -1059,7 +1337,7 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
+    return vision_analyze_tool(image_url, full_prompt, model, pages=pages, max_pages=max_pages)
 
 
 registry.register(

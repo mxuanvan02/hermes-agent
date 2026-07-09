@@ -15,6 +15,9 @@ from tools.vision_tools import (
     _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
+    _is_pdf_file,
+    _parse_pdf_pages,
+    _render_pdf_pages_for_vision,
     _resize_image_for_vision,
     _is_image_size_error,
     _MAX_BASE64_BYTES,
@@ -140,6 +143,31 @@ class TestDetermineMimeType:
 
     def test_unknown_extension_defaults_to_jpeg(self):
         assert _determine_mime_type(Path("file.xyz")) == "image/jpeg"
+
+
+class TestPdfHelpers:
+    def test_is_pdf_file_true_for_pdf_header(self, tmp_path):
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n%test\n")
+        assert _is_pdf_file(pdf) is True
+
+    def test_is_pdf_file_false_for_non_pdf(self, tmp_path):
+        txt = tmp_path / "doc.txt"
+        txt.write_text("hello", encoding="utf-8")
+        assert _is_pdf_file(txt) is False
+
+    def test_parse_pdf_pages_defaults_to_first_pages(self):
+        assert _parse_pdf_pages(None, page_count=9, max_pages=3) == [0, 1, 2]
+
+    def test_parse_pdf_pages_respects_ranges_and_dedupes(self):
+        assert _parse_pdf_pages("1,3-4,4", page_count=6, max_pages=10) == [0, 2, 3]
+
+    def test_parse_pdf_pages_caps_to_max_pages(self):
+        assert _parse_pdf_pages("1,2,3,4,5", page_count=10, max_pages=2) == [0, 1]
+
+    def test_parse_pdf_pages_rejects_out_of_range(self):
+        with pytest.raises(ValueError):
+            _parse_pdf_pages("0", page_count=5, max_pages=3)
 
 
 # ---------------------------------------------------------------------------
@@ -436,8 +464,83 @@ class TestVisionSafetyGuards:
             result = json.loads(await vision_analyze_tool(str(secret), "extract text"))
 
         assert result["success"] is False
-        assert "Only real image files are supported" in result["error"]
+        assert "Only real image files or PDF documents are supported" in result["error"]
         mock_llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_local_pdf_is_rendered_and_sent_to_vision(self, tmp_path):
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n%test\n1 0 obj\n<<>>\nendobj\n")
+        page_1 = tmp_path / "page-1.png"
+        page_2 = tmp_path / "page-2.png"
+        page_1.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        page_2.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "PDF page summary"
+        mock_response.choices = [mock_choice]
+
+        with (
+            patch("tools.vision_tools._get_pdf_page_count", return_value=2),
+            patch(
+                "tools.vision_tools._render_pdf_pages_with_pymupdf",
+                return_value=[(1, page_1), (2, page_2)],
+            ),
+            patch(
+                "tools.vision_tools._resize_image_for_vision",
+                side_effect=["data:image/png;base64,one", "data:image/png;base64,two"],
+            ) as mock_b64,
+            patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                return_value=mock_response,
+            ) as mock_llm,
+        ):
+            result = json.loads(await vision_analyze_tool(str(pdf), "What does it show?"))
+
+        assert result["success"] is True
+        assert mock_b64.call_count == 2
+        content = mock_llm.await_args.kwargs["messages"][0]["content"]
+        assert content[0]["text"].startswith("This source is a PDF document")
+        assert content[1]["text"] == "PDF page 1:"
+        assert content[3]["text"] == "PDF page 2:"
+
+    @pytest.mark.asyncio
+    async def test_pdf_render_helper_uses_pymupdf_when_available(self, tmp_path):
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.7\n%test\n")
+
+        class FakePixmap:
+            def save(self, path):
+                Path(path).write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        class FakePage:
+            def get_pixmap(self, matrix=None, alpha=False):
+                return FakePixmap()
+
+        class FakeDoc:
+            page_count = 2
+
+            def load_page(self, page_index):
+                return FakePage()
+
+            def close(self):
+                return None
+
+        fake_fitz = MagicMock()
+        fake_fitz.Matrix.return_value = object()
+        fake_fitz.open.return_value = FakeDoc()
+
+        with (
+            patch.dict("sys.modules", {"fitz": fake_fitz}),
+            patch("tools.vision_tools.shutil.which", return_value=None),
+        ):
+            rendered = _render_pdf_pages_for_vision(pdf, pages="1-2", max_pages=5)
+
+        assert [page for page, _ in rendered] == [1, 2]
+        assert rendered[0][1].exists()
+        assert rendered[1][1].exists()
 
     @pytest.mark.asyncio
     async def test_blocked_remote_url_short_circuits_before_download(self):
