@@ -3577,10 +3577,10 @@ class TestRunConversation:
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
 
-    def test_truncated_tool_args_detected_when_finish_reason_not_length(self, agent):
+    def test_truncated_tool_args_retry_chunked_when_finish_reason_not_length(self, agent):
         """When a router rewrites finish_reason from 'length' to 'tool_calls',
-        truncated JSON arguments should still be detected and refused rather
-        than wasting 3 retry attempts."""
+        truncated JSON arguments should be retried with a chunking steer rather
+        than immediately failing the visible turn."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
@@ -3588,10 +3588,49 @@ class TestRunConversation:
             arguments='{"path":"report.md","content":"partial',
             call_id="c1",
         )
-        resp = _mock_response(
+        bad_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[bad_tc],
         )
-        agent.client.chat.completions.create.return_value = resp
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"small chunk"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="stop", tool_calls=[good_tc],
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            bad_resp, good_resp, final_resp,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Done!"
+        mock_handle_function_call.assert_called_once()
+        second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        assert second_call_messages[-1]["role"] == "user"
+        assert "Break the work into smaller" in second_call_messages[-1]["content"]
+
+    def test_truncated_tool_args_still_fail_after_chunked_retries(self, agent):
+        """Repeated truncated tool args eventually fail without executing when no fallback exists."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[bad_tc],
+        )
 
         with (
             patch("run_agent.handle_function_call") as mock_handle_function_call,
@@ -3605,6 +3644,52 @@ class TestRunConversation:
         assert result["partial"] is True
         assert "truncated due to output length limit" in result["error"]
         mock_handle_function_call.assert_not_called()
+        assert agent.client.chat.completions.create.call_count == 4
+
+    def test_truncated_tool_args_fallback_after_chunked_retries(self, agent):
+        """Repeated truncated tool args should try the next fallback before failing."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("terminal")
+        agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        bad_tc = _mock_tool_call(
+            name="terminal",
+            arguments='{"command":"python - <<EOF\npartial',
+            call_id="c1",
+        )
+        bad_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[bad_tc],
+        )
+        final_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [
+            bad_resp, bad_resp, bad_resp, bad_resp, final_resp,
+        ]
+
+        fallback_called = {"called": False}
+
+        def _mock_fallback():
+            fallback_called["called"] = True
+            agent._fallback_index = 1
+            agent._fallback_activated = True
+            agent.model = "anthropic/claude-sonnet-4"
+            agent.provider = "openrouter"
+            return True
+
+        with (
+            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
+        ):
+            result = agent.run_conversation("run the report pipeline")
+
+        assert fallback_called["called"] is True
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback answer."
+        mock_handle_function_call.assert_not_called()
+        assert agent.client.chat.completions.create.call_count == 5
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must call kanban_block when iteration

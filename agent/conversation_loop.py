@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.anthropic_adapter import _is_oauth_token
 from agent.auxiliary_client import set_runtime_main
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.context_budgeter import apply_context_budget
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -357,6 +358,22 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
             "length limit. Continue exactly where you left off. Do not "
             "restart or repeat prior text. Finish the answer directly.]"
         )
+
+
+def _get_truncated_tool_call_retry_prompt(tool_names: Optional[List[str]] = None) -> str:
+    tool_hint = ""
+    if tool_names:
+        tool_hint = f" for {', '.join(tool_names[:3])}"
+    return (
+        "[System: Your previous tool call"
+        f"{tool_hint} was cut off before its JSON arguments were complete. "
+        "Do not retry the same large tool call. Break the work into smaller "
+        "tool calls with compact JSON arguments. For write_file or patch, "
+        "write smaller chunks/patches instead of one huge payload. For terminal, "
+        "use shorter commands and avoid embedding large scripts inline. "
+        "Each tool call's arguments must be valid JSON and should stay under "
+        "~8K tokens.]"
+    )
 
 
 def run_conversation(
@@ -706,6 +723,7 @@ def run_conversation(
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
+    max_truncated_tool_call_retries = 3
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
@@ -1056,6 +1074,30 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        # Per-request context budget.  This trims the API copy only (never the
+        # persisted transcript) when the request exceeds the configured budget,
+        # and records quantitative metrics for logs/plugins.
+        _context_budget_cfg = getattr(agent, "context_budget_config", None)
+        _context_budget_ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+        api_messages, _context_budget_metrics = apply_context_budget(
+            api_messages,
+            tools=agent.tools or None,
+            config=_context_budget_cfg,
+            context_length=_context_budget_ctx,
+            max_tokens=agent.max_tokens,
+        )
+        agent._last_context_budget_metrics = _context_budget_metrics.as_dict()
+        if _context_budget_metrics.enabled:
+            logger.info("context_budget %s", agent._last_context_budget_metrics)
+
+        # The budgeter runs after the normal pre-call sanitizer.  If it trims
+        # any part of a tool-call/result pair, strict OpenAI-compatible
+        # providers reject the request with "No tool call found".  Re-run the
+        # wire-copy cleanup after budgeting so the final payload is valid even
+        # when older session history already contains a partial tool group.
+        api_messages = agent._sanitize_api_messages(api_messages)
+        api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
@@ -1228,6 +1270,7 @@ def run_conversation(
                         approx_input_tokens=approx_tokens,
                         request_char_count=total_chars,
                         max_tokens=agent.max_tokens,
+                        context_budget=agent._last_context_budget_metrics or {},
                     )
                 except Exception:
                     pass
@@ -1716,18 +1759,39 @@ def run_conversation(
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
                         if assistant_message is not None and _trunc_has_tool_calls:
-                            if truncated_tool_call_retries < 1:
+                            if truncated_tool_call_retries < max_truncated_tool_call_retries:
                                 truncated_tool_call_retries += 1
+                                _tool_names = [
+                                    getattr(getattr(tc, "function", None), "name", "")
+                                    for tc in (getattr(assistant_message, "tool_calls", None) or [])
+                                ]
+                                _tool_names = [name for name in _tool_names if name]
                                 agent._buffer_vprint(
-                                    f"⚠️  Truncated tool call detected — retrying API call..."
+                                    "⚠️  Truncated tool call detected — requesting "
+                                    f"chunked retry ({truncated_tool_call_retries}/"
+                                    f"{max_truncated_tool_call_retries})..."
                                 )
-                                # Don't append the broken response to messages;
-                                # just re-run the same API call from the current
-                                # message state, giving the model another chance.
+                                # Don't append the broken assistant response.
+                                # Add a compact retry steer so the model does
+                                # not repeat the same oversized tool call.
+                                messages.append({
+                                    "role": "user",
+                                    "content": _get_truncated_tool_call_retry_prompt(_tool_names),
+                                })
+                                agent._session_messages = messages
                                 continue
                             agent._flush_status_buffer()
                             agent._vprint(
-                                f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
+                                f"{agent.log_prefix}⚠️  Truncated tool call response detected again — trying fallback provider.",
+                                force=True,
+                            )
+                            truncated_tool_call_retries = 0
+                            agent._invalid_json_retries = 0
+                            if agent._try_activate_fallback():
+                                agent._session_messages = messages
+                                continue
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  No fallback available — refusing to execute incomplete tool arguments.",
                                 force=True,
                             )
                             agent._cleanup_task_resources(effective_task_id)
@@ -3670,12 +3734,41 @@ def run_conversation(
                         if tc.function.name in {n for n, _ in invalid_json_args}
                     )
                     if _truncated:
+                        _tool_names = [name for name, _ in invalid_json_args]
+                        if truncated_tool_call_retries < max_truncated_tool_call_retries:
+                            truncated_tool_call_retries += 1
+                            agent._buffer_vprint(
+                                "⚠️  Truncated tool call arguments detected "
+                                f"(finish_reason={finish_reason!r}) — requesting "
+                                f"chunked retry ({truncated_tool_call_retries}/"
+                                f"{max_truncated_tool_call_retries})..."
+                            )
+                            agent._invalid_json_retries = 0
+                            # Do not append the broken assistant/tool-call.
+                            # Steer the next call to shrink payloads so long
+                            # write_file/terminal arguments do not truncate
+                            # again and fail the user-visible turn.
+                            messages.append({
+                                "role": "user",
+                                "content": _get_truncated_tool_call_retry_prompt(_tool_names),
+                            })
+                            agent._session_messages = messages
+                            continue
+
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
-                            f"(finish_reason={finish_reason!r}) — refusing to execute.",
+                            f"again (finish_reason={finish_reason!r}) — trying fallback provider.",
                             force=True,
                         )
+                        truncated_tool_call_retries = 0
                         agent._invalid_json_retries = 0
+                        if agent._try_activate_fallback():
+                            agent._session_messages = messages
+                            continue
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  No fallback available — refusing to execute.",
+                            force=True,
+                        )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {

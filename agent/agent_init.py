@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.context_budgeter import context_budget_config_from_mapping
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.model_metadata import (
@@ -1459,6 +1460,18 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
         )
     agent.compression_enabled = compression_enabled
+
+    # API-copy context budgeter.  Unlike the durable context compressor above,
+    # this trims only the outgoing request copy and records quantitative
+    # metrics for each API call.  It is intentionally config-gated because it
+    # can omit older middle turns when the request exceeds the operator budget.
+    try:
+        _context_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+        _budget_cfg = _context_cfg.get("budget", {}) if isinstance(_context_cfg, dict) else {}
+    except Exception:
+        _budget_cfg = {}
+    agent.context_budget_config = context_budget_config_from_mapping(_budget_cfg)
+    agent._last_context_budget_metrics = None
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
