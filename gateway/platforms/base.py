@@ -991,6 +991,99 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def validate_media_delivery_path_with_reason(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Like :func:`validate_media_delivery_path`, but also returns a reject reason.
+
+    Returns ``(safe_path, None)`` when the path is accepted, or
+    ``(None, reason)`` when rejected. ``reason`` is one of:
+
+    - ``"empty"``        — empty/blank input after stripping quote noise
+    - ``"not_absolute"`` — path is not absolute (MEDIA requires absolute paths)
+    - ``"not_found"``    — file does not exist / cannot be resolved
+    - ``"not_a_file"``   — path resolves but is not a regular file (e.g. a dir)
+    - ``"denied"``       — under the credential / system-path denylist
+    - ``"outside_allowlist"`` — strict mode, not allowlisted and not recent
+
+    The distinction matters for diagnostics: a hallucinated or mistyped path
+    (``not_found``) is a very different failure from a real security block
+    (``denied``/``outside_allowlist``), and conflating them in the log
+    ("unsafe path outside allowed roots") sent past investigations down the
+    wrong track.
+    """
+    if not path:
+        return None, "empty"
+
+    candidate = str(path).strip()
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
+        candidate = candidate[1:-1].strip()
+    candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
+    if not candidate:
+        return None, "empty"
+
+    expanded = Path(os.path.expanduser(candidate))
+    if not expanded.is_absolute():
+        return None, "not_absolute"
+
+    try:
+        resolved = expanded.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None, "not_found"
+
+    if not resolved.is_file():
+        return None, "not_a_file"
+
+    # Cache / operator allowlist is always honored — these are unconditionally
+    # trusted regardless of mode.
+    for root in _media_delivery_allowed_roots():
+        try:
+            resolved_root = root.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if _path_is_within(resolved, resolved_root):
+            return str(resolved), None
+
+    # Non-strict mode (default): accept anything not on the denylist.
+    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
+    # ~/.hermes/auth.json, etc. — so the obvious prompt-injection sites
+    # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``) remain rejected.
+    if not _media_delivery_strict_mode():
+        if _path_under_denied_prefix(resolved):
+            return None, "denied"
+        return str(resolved), None
+
+    # Strict mode: fall back to recency-based trust for freshly-produced
+    # files (e.g. ``pandoc -o /tmp/report.pdf`` or
+    # ``write_file("/home/user/report.pdf", ...)``). System paths and
+    # credential locations remain blocked even when "recent" — see
+    # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist.
+    window = _media_delivery_recency_seconds()
+    if window > 0 and not _path_under_denied_prefix(resolved):
+        if _file_is_recently_produced(resolved, window):
+            return str(resolved), None
+
+    return None, "outside_allowlist"
+
+
+# Human-readable explanations for each reject reason, surfaced to the model so
+# it can self-correct (e.g. fix a hallucinated path) instead of silently
+# believing a dropped attachment was delivered.
+_MEDIA_REJECT_REASON_MESSAGES = {
+    "empty": "empty path",
+    "not_absolute": "path is not absolute (MEDIA requires an absolute path)",
+    "not_found": "file does not exist at that path",
+    "not_a_file": "path is not a regular file",
+    "denied": "path is under a credential/system denylist and cannot be sent",
+    "outside_allowlist": (
+        "strict mode is on and the file is neither under an allowed root "
+        "nor recently produced"
+    ),
+}
+
+
+def _describe_media_reject_reason(reason: Optional[str]) -> str:
+    return _MEDIA_REJECT_REASON_MESSAGES.get(reason or "", "unknown reason")
+
+
 def validate_media_delivery_path(path: str) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
@@ -1011,58 +1104,8 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
 
     Symlinks are resolved before any containment / denylist check.
     """
-    if not path:
-        return None
-
-    candidate = str(path).strip()
-    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "`\"'":
-        candidate = candidate[1:-1].strip()
-    candidate = candidate.lstrip("`\"'").rstrip("`\"',.;:)}]")
-    if not candidate:
-        return None
-
-    expanded = Path(os.path.expanduser(candidate))
-    if not expanded.is_absolute():
-        return None
-
-    try:
-        resolved = expanded.resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-    if not resolved.is_file():
-        return None
-
-    # Cache / operator allowlist is always honored — these are unconditionally
-    # trusted regardless of mode.
-    for root in _media_delivery_allowed_roots():
-        try:
-            resolved_root = root.expanduser().resolve(strict=False)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if _path_is_within(resolved, resolved_root):
-            return str(resolved)
-
-    # Non-strict mode (default): accept anything not on the denylist.
-    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env,
-    # ~/.hermes/auth.json, etc. — so the obvious prompt-injection sites
-    # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``) remain rejected.
-    if not _media_delivery_strict_mode():
-        if _path_under_denied_prefix(resolved):
-            return None
-        return str(resolved)
-
-    # Strict mode: fall back to recency-based trust for freshly-produced
-    # files (e.g. ``pandoc -o /tmp/report.pdf`` or
-    # ``write_file("/home/user/report.pdf", ...)``). System paths and
-    # credential locations remain blocked even when "recent" — see
-    # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist.
-    window = _media_delivery_recency_seconds()
-    if window > 0 and not _path_under_denied_prefix(resolved):
-        if _file_is_recently_produced(resolved, window):
-            return str(resolved)
-
-    return None
+    safe_path, _reason = validate_media_delivery_path_with_reason(path)
+    return safe_path
 
 
 SUPPORTED_DOCUMENT_TYPES = {
@@ -2397,25 +2440,47 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths."""
+        safe_media, _dropped = BasePlatformAdapter.filter_media_delivery_paths_ex(media_files)
+        return safe_media
+
+    @staticmethod
+    def filter_media_delivery_paths_ex(media_files):
+        """Drop unsafe MEDIA paths, returning (safe_media, dropped).
+
+        ``dropped`` is a list of ``(original_path, reason)`` for each rejected
+        attachment so callers can surface a warning back to the model — a
+        silently-dropped file is exactly what made it look like attachments
+        were delivered when they weren't.
+        """
         safe_media: List[Tuple[str, bool]] = []
+        dropped: List[Tuple[str, str]] = []
         for media_path, is_voice in media_files or []:
-            safe_path = validate_media_delivery_path(str(media_path))
+            safe_path, reason = validate_media_delivery_path_with_reason(str(media_path))
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                logger.warning("Skipping unsafe MEDIA directive path outside allowed roots")
-        return safe_media
+                dropped.append((str(media_path), reason or "unknown"))
+                logger.warning(
+                    "Dropping MEDIA attachment %r: %s",
+                    str(media_path),
+                    _describe_media_reject_reason(reason),
+                )
+        return safe_media, dropped
 
     @staticmethod
     def filter_local_delivery_paths(file_paths) -> List[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
         safe_paths: List[str] = []
         for file_path in file_paths or []:
-            safe_path = validate_media_delivery_path(str(file_path))
+            safe_path, reason = validate_media_delivery_path_with_reason(str(file_path))
             if safe_path:
                 safe_paths.append(safe_path)
             else:
-                logger.warning("Skipping unsafe local file path outside allowed roots")
+                logger.warning(
+                    "Dropping local file path %r: %s",
+                    str(file_path),
+                    _describe_media_reject_reason(reason),
+                )
         return safe_paths
 
     @staticmethod

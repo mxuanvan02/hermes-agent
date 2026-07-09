@@ -331,6 +331,254 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+# ---------------------------------------------------------------------------
+# LaTeX / math → Unicode
+# ---------------------------------------------------------------------------
+# Telegram MarkdownV2 has no math rendering, so LaTeX like `$x^2$` or
+# `\frac{a}{b}` would otherwise reach the user as raw backslash-noise.  We map
+# the common symbol/greek/operator commands to their Unicode equivalents and
+# convert simple super/subscripts, so the message reads naturally on mobile.
+
+# Greek letters, operators, arrows, set/logic symbols.  Longer names must be
+# tried before their prefixes (e.g. \varepsilon before \epsilon), which the
+# alternation below handles by sorting keys longest-first.
+_LATEX_SYMBOLS: dict = {
+    # lowercase greek
+    'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
+    'varepsilon': 'ε', 'zeta': 'ζ', 'eta': 'η', 'theta': 'θ', 'vartheta': 'ϑ',
+    'iota': 'ι', 'kappa': 'κ', 'lambda': 'λ', 'mu': 'μ', 'nu': 'ν', 'xi': 'ξ',
+    'pi': 'π', 'varpi': 'ϖ', 'rho': 'ρ', 'varrho': 'ϱ', 'sigma': 'σ',
+    'varsigma': 'ς', 'tau': 'τ', 'upsilon': 'υ', 'phi': 'φ', 'varphi': 'ϕ',
+    'chi': 'χ', 'psi': 'ψ', 'omega': 'ω',
+    # uppercase greek
+    'Gamma': 'Γ', 'Delta': 'Δ', 'Theta': 'Θ', 'Lambda': 'Λ', 'Xi': 'Ξ',
+    'Pi': 'Π', 'Sigma': 'Σ', 'Upsilon': 'Υ', 'Phi': 'Φ', 'Psi': 'Ψ',
+    'Omega': 'Ω',
+    # operators & relations
+    'times': '×', 'div': '÷', 'pm': '±', 'mp': '∓', 'cdot': '·',
+    'ast': '∗', 'star': '⋆', 'leq': '≤', 'le': '≤', 'geq': '≥', 'ge': '≥',
+    'neq': '≠', 'ne': '≠', 'equiv': '≡', 'approx': '≈', 'cong': '≅',
+    'sim': '∼', 'simeq': '≃', 'propto': '∝', 'll': '≪', 'gg': '≫',
+    'infty': '∞', 'partial': '∂', 'nabla': '∇', 'sum': '∑', 'prod': '∏',
+    'int': '∫', 'oint': '∮', 'sqrt': '√', 'forall': '∀', 'exists': '∃',
+    'nexists': '∄', 'in': '∈', 'notin': '∉', 'ni': '∋', 'subset': '⊂',
+    'supset': '⊃', 'subseteq': '⊆', 'supseteq': '⊇', 'cup': '∪', 'cap': '∩',
+    'prec': '≺', 'succ': '≻', 'preceq': '⪯', 'succeq': '⪰',
+    'emptyset': '∅', 'varnothing': '∅', 'setminus': '∖', 'wedge': '∧',
+    'vee': '∨', 'neg': '¬', 'lnot': '¬', 'oplus': '⊕', 'otimes': '⊗',
+    'perp': '⊥', 'parallel': '∥', 'angle': '∠', 'triangle': '△',
+    'degree': '°', 'circ': '∘', 'bullet': '•', 'dagger': '†', 'ddagger': '‡',
+    'ldots': '…', 'cdots': '⋯', 'dots': '…', 'prime': '′',
+    # arrows
+    'to': '→', 'rightarrow': '→', 'leftarrow': '←', 'leftrightarrow': '↔',
+    'Rightarrow': '⇒', 'Leftarrow': '⇐', 'Leftrightarrow': '⇔',
+    'uparrow': '↑', 'downarrow': '↓', 'mapsto': '↦', 'implies': '⇒',
+    'iff': '⇔',
+    # misc
+    'hbar': 'ℏ', 'ell': 'ℓ', 'Re': 'ℜ', 'Im': 'ℑ', 'aleph': 'ℵ',
+    'nabla': '∇', 'top': '⊤', 'bot': '⊥', 'checkmark': '✓',
+}
+
+# \mathbb{R} and friends → blackboard-bold letters.
+_LATEX_MATHBB: dict = {
+    'A': '𝔸', 'B': '𝔹', 'C': 'ℂ', 'D': '𝔻', 'E': '𝔼', 'F': '𝔽', 'G': '𝔾',
+    'H': 'ℍ', 'I': '𝕀', 'J': '𝕁', 'K': '𝕂', 'L': '𝕃', 'M': '𝕄', 'N': 'ℕ',
+    'O': '𝕆', 'P': 'ℙ', 'Q': 'ℚ', 'R': 'ℝ', 'S': '𝕊', 'T': '𝕋', 'U': '𝕌',
+    'V': '𝕍', 'W': '𝕎', 'X': '𝕏', 'Y': '𝕐', 'Z': 'ℤ',
+}
+
+# \mathcal{X} → script-style capitals (some map to letterlike-symbols block).
+_LATEX_MATHCAL: dict = {
+    'A': '𝒜', 'B': 'ℬ', 'C': '𝒞', 'D': '𝒟', 'E': 'ℰ', 'F': 'ℱ', 'G': '𝒢',
+    'H': 'ℋ', 'I': 'ℐ', 'J': '𝒥', 'K': '𝒦', 'L': 'ℒ', 'M': 'ℳ', 'N': '𝒩',
+    'O': '𝒪', 'P': '𝒫', 'Q': '𝒬', 'R': 'ℛ', 'S': '𝒮', 'T': '𝒯', 'U': '𝒰',
+    'V': '𝒱', 'W': '𝒲', 'X': '𝒳', 'Y': '𝒴', 'Z': '𝒵',
+}
+
+_SUPERSCRIPT_MAP: dict = {
+    '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶',
+    '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽',
+    ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ', 'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ',
+    'e': 'ᵉ', 'f': 'ᶠ', 'g': 'ᵍ', 'h': 'ʰ', 'j': 'ʲ', 'k': 'ᵏ', 'l': 'ˡ',
+    'm': 'ᵐ', 'o': 'ᵒ', 'p': 'ᵖ', 'r': 'ʳ', 's': 'ˢ', 't': 'ᵗ', 'u': 'ᵘ',
+    'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ', 'y': 'ʸ', 'z': 'ᶻ',
+}
+
+_SUBSCRIPT_MAP: dict = {
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆',
+    '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '=': '₌', '(': '₍',
+    ')': '₎', 'a': 'ₐ', 'e': 'ₑ', 'h': 'ₕ', 'i': 'ᵢ', 'j': 'ⱼ', 'k': 'ₖ',
+    'l': 'ₗ', 'm': 'ₘ', 'n': 'ₙ', 'o': 'ₒ', 'p': 'ₚ', 'r': 'ᵣ', 's': 'ₛ',
+    't': 'ₜ', 'u': 'ᵤ', 'v': 'ᵥ', 'x': 'ₓ',
+}
+
+_LATEX_SYMBOL_RE = re.compile(
+    r'\\(' + '|'.join(
+        re.escape(k) for k in sorted(_LATEX_SYMBOLS, key=len, reverse=True)
+    ) + r')(?![a-zA-Z])'
+)
+
+
+def _to_script(body: str, mapping: dict) -> str | None:
+    """Map every char of *body* through *mapping*; return None if any misses."""
+    out = []
+    for ch in body:
+        repl = mapping.get(ch)
+        if repl is None:
+            return None
+        out.append(repl)
+    return ''.join(out)
+
+
+def _convert_latex_math(expr: str) -> str:
+    """Convert the inside of a math span to a Unicode approximation."""
+    s = expr
+
+    # Protect escaped braces ``\{`` / ``\}`` (literal set notation) from the
+    # brace-stripping step at the end.  Stash behind private-use sentinels and
+    # restore as literal ``{`` / ``}`` after all brace-based macros run.
+    _LB, _RB = '', ''
+    s = s.replace(r'\{', _LB).replace(r'\}', _RB)
+
+    # \text{...} / \mathrm{...} / \textsc{...} → literal contents
+    s = re.sub(
+        r'\\(?:text|textsc|mathrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}',
+        r'\1',
+        s,
+    )
+
+    # \mathbb{R} → ℝ
+    s = re.sub(
+        r'\\mathbb\s*\{([A-Z])\}',
+        lambda m: _LATEX_MATHBB.get(m.group(1), m.group(1)),
+        s,
+    )
+
+    # \mathcal{X} → script capital
+    s = re.sub(
+        r'\\mathcal\s*\{([A-Z])\}',
+        lambda m: _LATEX_MATHCAL.get(m.group(1), m.group(1)),
+        s,
+    )
+
+    # \frac{a}{b} → (a)/(b); bare single tokens skip the parens.
+    def _frac(m):
+        num, den = m.group(1), m.group(2)
+        num = num if len(num) == 1 else f'({num})'
+        den = den if len(den) == 1 else f'({den})'
+        return f'{num}/{den}'
+
+    for _ in range(3):  # resolve a few levels of nesting
+        new = re.sub(r'\\(?:frac|dfrac|tfrac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}', _frac, s)
+        if new == s:
+            break
+        s = new
+
+    # \sqrt{x} → √(x)
+    s = re.sub(r'\\sqrt\s*\{([^{}]*)\}', lambda m: '√(' + m.group(1) + ')', s)
+
+    # Symbol commands → unicode
+    s = _LATEX_SYMBOL_RE.sub(lambda m: _LATEX_SYMBOLS[m.group(1)], s)
+
+    # Superscripts: x^{abc} or x^a
+    def _sup(m):
+        body = m.group(1) if m.group(1) is not None else m.group(2)
+        conv = _to_script(body, _SUPERSCRIPT_MAP)
+        return conv if conv is not None else '^' + body
+
+    s = re.sub(r'\^\{([^{}]*)\}|\^(\S)', _sup, s)
+
+    # Subscripts: x_{abc} or x_a
+    def _sub(m):
+        body = m.group(1) if m.group(1) is not None else m.group(2)
+        conv = _to_script(body, _SUBSCRIPT_MAP)
+        return conv if conv is not None else '_' + body
+
+    s = re.sub(r'_\{([^{}]*)\}|_(\S)', _sub, s)
+
+    # \quad / \qquad spacing macros → a single space.
+    s = re.sub(r'\\q?quad\b', ' ', s)
+
+    # Drop remaining braces and left/right sizing hints.
+    s = re.sub(r'\\(?:left|right|big|Big|bigg|Bigg)\b', '', s)
+    s = s.replace('{', '').replace('}', '')
+
+    # Restore protected escaped braces as literal ``{`` / ``}``.
+    s = s.replace(_LB, '{').replace(_RB, '}')
+
+    # Collapse the runaway whitespace LaTeX spacing macros leave behind.
+    s = re.sub(r'\\[,;:! ]', ' ', s)
+    s = re.sub(r'[ \t]{2,}', ' ', s)
+
+    return s.strip()
+
+
+def _looks_like_currency(text: str, start: int, end: int) -> bool:
+    """Heuristic: is a `$...$` span actually two currency amounts, not math?
+
+    A real inline-math span rarely contains a digit immediately after the
+    opening `$` followed later by another `$digit` (e.g. "$5 and $10").  We
+    treat the pair as currency when the inner text has no LaTeX markers and
+    both dollar signs hug digits.
+    """
+    inner = text[start + 1:end]
+    if '\\' in inner or '^' in inner or '_' in inner:
+        return False
+    # Opening `$` immediately followed by a digit, and the closing `$` is
+    # immediately followed by a digit too → looks like "$5...$10".
+    opens_on_digit = bool(inner[:1].isdigit())
+    closes_on_digit = end + 1 < len(text) and text[end + 1].isdigit()
+    return opens_on_digit and closes_on_digit
+
+
+def _convert_math_spans(text: str, render=None) -> str:
+    r"""Convert `$$...$$`, `\[...\]`, `$...$`, and `\(...\)` math to Unicode.
+
+    *render* maps a math span's inner LaTeX to its replacement.  It defaults
+    to :func:`_convert_latex_math` (plain Unicode); callers inside the
+    MarkdownV2 pipeline pass a wrapper that also escapes the result and stashes
+    it behind a placeholder so downstream steps leave it untouched.
+
+    Currency-looking `$...$` pairs are left untouched (see
+    :func:`_looks_like_currency`).
+    """
+    if render is None:
+        render = _convert_latex_math
+
+    if '$' not in text and '\\(' not in text and '\\[' not in text:
+        return text
+
+    # Display math first: $$...$$ and \[...\]
+    text = re.sub(r'\$\$(.+?)\$\$', lambda m: render(m.group(1)), text, flags=re.DOTALL)
+    text = re.sub(r'\\\[(.+?)\\\]', lambda m: render(m.group(1)), text, flags=re.DOTALL)
+
+    # Inline \(...\)
+    text = re.sub(r'\\\((.+?)\\\)', lambda m: render(m.group(1)), text, flags=re.DOTALL)
+
+    # Inline $...$ — scan manually so we can skip currency pairs.
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == '$':
+            # Find the matching closing '$' on some later position (no newlines).
+            j = text.find('$', i + 1)
+            if j == -1:
+                out.append(text[i:])
+                break
+            inner = text[i + 1:j]
+            if '\n' in inner or not inner.strip() or _looks_like_currency(text, i, j):
+                out.append(text[i])
+                i += 1
+                continue
+            out.append(render(inner))
+            i = j + 1
+        else:
+            out.append(text[i])
+            i += 1
+    return ''.join(out)
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -758,6 +1006,27 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
+        # Inject per-call media timeouts. Every native media send routes through
+        # this chokepoint, so setting read_timeout here covers send_document/
+        # send_photo/send_video/send_voice/send_audio uniformly. The bot-wide
+        # read_timeout (20s) bounds the wait for Telegram's response AFTER the
+        # upload bytes are pushed; for a large file the upload itself runs for
+        # minutes (governed by media_write_timeout) and then the 20s read_timeout
+        # fires right at the finish line — surfacing as "Failed to send document:
+        # Timed out" with the file never confirmed. Raise it only for media.
+        def _media_env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+        send_kwargs.setdefault(
+            "read_timeout",
+            _media_env_float("HERMES_TELEGRAM_MEDIA_READ_TIMEOUT", 600.0),
+        )
+        send_kwargs.setdefault(
+            "write_timeout",
+            _media_env_float("HERMES_TELEGRAM_HTTP_MEDIA_WRITE_TIMEOUT", 600.0),
+        )
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
@@ -859,6 +1128,109 @@ class TelegramAdapter(BasePlatformAdapter):
         if LinkPreviewOptions is not None:
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
+
+    @staticmethod
+    def _sanitize_rich_markdown_formula(text: str) -> str:
+        """Prevent stray ``$`` from being misparsed by Telegram rich markdown.
+
+        ``sendRichMessage`` (Bot API 10.1) renders ``$...$`` as a native
+        mathematical_expression block.  When a ``$`` is unpaired (odd count)
+        or opens a span that never closes, Telegram parses ``$E`` as a
+        *cashtag* (stock symbol), corrupting the surrounding text.
+        ``$5`` (digit after ``$``) is left alone because Telegram already
+        treats it as literal text.
+
+        Backslash escaping (``\\$``) does **not** prevent cashtag parsing in
+        rich markdown — Telegram strips the backslash but still creates the
+        cashtag entity.  The only reliable way to suppress cashtag parsing
+        while preserving visual appearance is to insert a zero-width space
+        (U+200B) between ``$`` and the following letter.
+
+        Strategy: walk the text, pair up valid ``$...$`` formula spans
+        (no newline inside, length <= 500, content non-empty), and insert
+        a zero-width space after every ``$`` that is not part of a valid
+        formula pair and is followed by a letter.
+        """
+        # Transliterate LaTeX math to Unicode up front.  sendRichMessage is
+        # documented to render ``$...$`` natively, but not every Telegram
+        # client does \u2014 some show the raw ``$k$`` / ``\subseteq`` / ``\mathcal``
+        # source.  Converting to Unicode here (the choke point every rich send
+        # passes through) makes formulas legible regardless of client support,
+        # and strips the ``$`` delimiters so the cashtag guard below has less
+        # to do.  Currency-looking ``$...$`` pairs are preserved by
+        # _convert_math_spans (see _looks_like_currency).
+        text = _convert_math_spans(text)
+        if "$" not in text:
+            return text
+        ZWSP = "\u200b"
+        out: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch != "$":
+                out.append(ch)
+                i += 1
+                continue
+            # ``$`` at position i — try to match a valid formula close.
+            # A valid formula open: ``$`` followed by a non-space, non-digit
+            # character (letters/symbols).  ``$5`` is a literal price and
+            # is left untouched.
+            next_ch = text[i + 1] if i + 1 < n else ""
+            if next_ch == "" or next_ch.isspace() or next_ch.isdigit():
+                # Not a formula open — keep literal ``$``.
+                out.append(ch)
+                i += 1
+                continue
+            # Search for the closing ``$`` on the same line, within 500 chars.
+            close_idx = -1
+            j = i + 1
+            while j < n and j - i <= 500:
+                if text[j] == "\n":
+                    break
+                if text[j] == "$":
+                    close_idx = j
+                    break
+                j += 1
+            if close_idx == -1 or close_idx == i + 1:
+                # No valid close found — insert zero-width space to prevent
+                # Telegram from parsing ``$E`` as a cashtag.
+                out.append(ch)
+                out.append(ZWSP)
+                i += 1
+                continue
+            # Valid formula span — emit ``$...$`` verbatim.
+            out.append(text[i : close_idx + 1])
+            i = close_idx + 1
+        return "".join(out)
+
+    async def _send_rich_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        disable_notification: bool = False,
+    ) -> Any:
+        """Send via Telegram Bot API 10.1 sendRichMessage endpoint.
+
+        Unlike send_message+parse_mode=MarkdownV2, sendRichMessage natively
+        renders formulas ($E=mc^2$), <sup>/<sub>, <mark>, <details>, spoilers,
+        and headings without escaping special characters.  Falls back to the
+        legacy send_message path on any error.
+        """
+        rich_message: Dict[str, Any] = {"markdown": self._sanitize_rich_markdown_formula(text)}
+        data: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": rich_message,
+        }
+        if reply_to_message_id is not None:
+            data["reply_to_message_id"] = reply_to_message_id
+        if message_thread_id is not None:
+            data["message_thread_id"] = message_thread_id
+        if disable_notification:
+            data["disable_notification"] = True
+        return await self._bot._post("sendRichMessage", data)
 
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
@@ -1518,6 +1890,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "connect_timeout": _env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
                 "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
+                # Media uploads use a SEPARATE timeout in PTB (default 20s), which
+                # the generic write_timeout above does not cover. A 20s ceiling
+                # fails any sizable document over a slow/NAT'd link (a 22 MB zip
+                # needs ~5 min through Colima's NAT), surfacing as the recurring
+                # "[Telegram] Failed to send document: Timed out". Default 600s.
+                "media_write_timeout": _env_float("HERMES_TELEGRAM_HTTP_MEDIA_WRITE_TIMEOUT", 600.0),
             }
 
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
@@ -1822,10 +2200,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
-            formatted = self.format_message(content)
+            # Format and split message if needed.
+            # For sendRichMessage (Bot API 10.1) we send raw markdown — the
+            # endpoint handles bold/italic/headings/formulas/sup/sub natively
+            # without MarkdownV2 escaping.  We still compute the MarkdownV2
+            # formatted version as a fallback path.
+            formatted_mdv2 = self.format_message(content)
             chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                formatted_mdv2, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
             )
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix. Escape the
@@ -1835,6 +2217,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
                     for chunk in chunks
                 ]
+            # Raw markdown chunks for sendRichMessage (no MarkdownV2 escaping).
+            raw_chunks = self.truncate_message(
+                content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+            )
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
@@ -1857,6 +2243,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
+                raw_chunk = raw_chunks[i] if i < len(raw_chunks) else chunk
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
@@ -1902,33 +2289,47 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
+                        # Try sendRichMessage (Bot API 10.1) first — native
+                        # formula/sup/sub/mark/headings rendering.  Falls back
+                        # to send_message+MarkdownV2, then plain text.
                         try:
-                            msg = await self._bot.send_message(
+                            result = await self._send_rich_message(
                                 chat_id=int(chat_id),
-                                text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
+                                text=raw_chunk,
                                 reply_to_message_id=reply_to_id,
-                                **thread_kwargs,
-                                **self._link_preview_kwargs(),
-                                **self._notification_kwargs(metadata),
+                                message_thread_id=thread_kwargs.get("message_thread_id"),
+                                disable_notification=bool(self._notification_kwargs(metadata).get("disable_notification")),
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
+                            msg = type("RichMsg", (), {"message_id": result.get("message_id") if isinstance(result, dict) else getattr(result, "message_id", None)})()
+                        except Exception as rich_error:
+                            # sendRichMessage failed — fall back to MarkdownV2
+                            logger.debug("[%s] sendRichMessage failed, falling back to MarkdownV2: %s", self.name, rich_error)
+                            try:
                                 msg = await self._bot.send_message(
                                     chat_id=int(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
+                                    text=chunk,
+                                    parse_mode=ParseMode.MARKDOWN_V2,
                                     reply_to_message_id=reply_to_id,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
                                 )
-                            else:
-                                raise
+                            except Exception as md_error:
+                                # Markdown parsing failed, try plain text
+                                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                                    logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                    plain_chunk = _strip_mdv2(chunk)
+                                    msg = await self._bot.send_message(
+                                        chat_id=int(chat_id),
+                                        text=plain_chunk,
+                                        parse_mode=None,
+                                        reply_to_message_id=reply_to_id,
+                                        **thread_kwargs,
+                                        **self._link_preview_kwargs(),
+                                        **self._notification_kwargs(metadata),
+                                    )
+                                else:
+                                    raise
                         break  # success
                     except _NetErr as send_err:
                         # BadRequest is a subclass of NetworkError in
@@ -2145,24 +2546,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=message_id)
 
-            formatted = self.format_message(content)
+            # Bot API 10.1: editMessageText accepts a rich_message parameter
+            # that natively renders formulas, headings, tables, sup/sub, etc.
+            # Try rich first (matches send() path), fall back to MarkdownV2,
+            # then plain text.  Without this, streamed replies finalize via
+            # MarkdownV2 which downgrades ## headings to bold and breaks tables.
             try:
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=formatted,
-                    parse_mode=ParseMode.MARKDOWN_V2,
+                await self._bot._post(
+                    "editMessageText",
+                    data={
+                        "chat_id": int(chat_id),
+                        "message_id": int(message_id),
+                        "rich_message": {"markdown": self._sanitize_rich_markdown_formula(content)},
+                    },
                 )
-            except Exception as fmt_err:
-                # "Message is not modified" is a no-op, not an error
-                if "not modified" in str(fmt_err).lower():
-                    return SendResult(success=True, message_id=message_id)
-                # Fallback: retry without markdown formatting
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=content,
-                )
+            except Exception as rich_err:
+                logger.debug("[%s] editMessageText rich failed, falling back to MarkdownV2: %s", self.name, rich_err)
+                formatted = self.format_message(content)
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=formatted,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                    )
+                except Exception as fmt_err:
+                    # "Message is not modified" is a no-op, not an error
+                    if "not modified" in str(fmt_err).lower():
+                        return SendResult(success=True, message_id=message_id)
+                    # Fallback: retry without markdown formatting
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=content,
+                    )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -2277,23 +2694,40 @@ class TelegramAdapter(BasePlatformAdapter):
         first_chunk = chunks[0]
         try:
             if finalize:
-                # Use format_message + parse_mode for the final chunk;
-                # mirror edit_message's main happy-path.
-                formatted = self.format_message(first_chunk)
+                # Mirror edit_message's happy path: rich_message first (Bot
+                # API 10.1 native formula/heading rendering), then MarkdownV2,
+                # then plain. Without the rich attempt the overflow path
+                # downgraded every split reply to MarkdownV2/plain, breaking
+                # $...$ formulas and ## headings on long messages.
                 try:
-                    await self._bot.edit_message_text(
-                        chat_id=int(chat_id),
-                        message_id=int(message_id),
-                        text=formatted,
-                        parse_mode=ParseMode.MARKDOWN_V2,
+                    await self._bot._post(
+                        "editMessageText",
+                        data={
+                            "chat_id": int(chat_id),
+                            "message_id": int(message_id),
+                            "rich_message": {"markdown": self._sanitize_rich_markdown_formula(first_chunk)},
+                        },
                     )
-                except Exception as fmt_err:
-                    if "not modified" not in str(fmt_err).lower():
+                except Exception as rich_err:
+                    logger.debug(
+                        "[%s] Overflow first-chunk rich edit failed, falling back to MarkdownV2: %s",
+                        self.name, rich_err,
+                    )
+                    formatted = self.format_message(first_chunk)
+                    try:
                         await self._bot.edit_message_text(
                             chat_id=int(chat_id),
                             message_id=int(message_id),
-                            text=first_chunk,
+                            text=formatted,
+                            parse_mode=ParseMode.MARKDOWN_V2,
                         )
+                    except Exception as fmt_err:
+                        if "not modified" not in str(fmt_err).lower():
+                            await self._bot.edit_message_text(
+                                chat_id=int(chat_id),
+                                message_id=int(message_id),
+                                text=first_chunk,
+                            )
             else:
                 await self._bot.edit_message_text(
                     chat_id=int(chat_id),
@@ -2331,6 +2765,36 @@ class TelegramAdapter(BasePlatformAdapter):
                 metadata,
                 reply_to_message_id=reply_to_id,
             )
+            # On finalize, try sendRichMessage first (native formula/heading
+            # rendering) — mirrors send()'s happy path.  Streaming edits stay
+            # plain to avoid re-rendering churn.
+            if finalize:
+                try:
+                    result = await self._send_rich_message(
+                        chat_id=int(chat_id),
+                        text=chunk,
+                        reply_to_message_id=reply_to_id,
+                        message_thread_id=thread_kwargs.get("message_thread_id"),
+                        disable_notification=bool(
+                            self._notification_kwargs(metadata).get("disable_notification")
+                        ),
+                    )
+                    rich_mid = (
+                        result.get("message_id")
+                        if isinstance(result, dict)
+                        else getattr(result, "message_id", None)
+                    )
+                    sent_msg = type("RichMsg", (), {"message_id": rich_mid})()
+                except Exception as rich_err:
+                    logger.debug(
+                        "[%s] Overflow continuation rich failed, falling back to MarkdownV2: %s",
+                        self.name, rich_err,
+                    )
+            if sent_msg is not None:
+                new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+                continuation_ids.append(new_id)
+                prev_id = new_id
+                continue
             for use_markdown in (True, False) if finalize else (False,):
                 try:
                     text = self.format_message(chunk) if use_markdown else chunk
@@ -4226,6 +4690,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 1) Protect fenced code blocks (``` ... ```)
         #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
+        #    Exception: ```markdown / ```md blocks are not real code — the
+        #    agent wrapped markdown output in a code fence.  Strip the fence
+        #    so the inner markdown converts to bold/italic/header like normal
+        #    text instead of showing raw **bold** / ## header literals.
         def _protect_fenced(m):
             raw = m.group(0)
             # Split off opening ``` (with optional language) and closing ```
@@ -4233,6 +4701,11 @@ class TelegramAdapter(BasePlatformAdapter):
             opening = raw[:open_end]
             body_and_close = raw[open_end:]
             body = body_and_close[:-3]
+            lang = opening[3:].strip().lower()
+            if lang in {"markdown", "md"}:
+                # Not a code block — return inner body for normal markdown
+                # conversion.  Preserve a trailing newline if present.
+                return body
             body = body.replace('\\', '\\\\').replace('`', '\\`')
             return _ph(opening + body + '```')
 
@@ -4249,6 +4722,16 @@ class TelegramAdapter(BasePlatformAdapter):
             lambda m: _ph(m.group(0).replace('\\', '\\\\')),
             text,
         )
+
+        # 2.5) Convert LaTeX math ($$...$$, \[...\], $...$, \(...\)) to a
+        #      Unicode approximation.  Runs after code protection (so math
+        #      inside code spans is left alone) and before the markdown
+        #      conversions.  The converted result is escaped and stashed as a
+        #      placeholder so later steps never re-process the Unicode output.
+        def _convert_math_placeholder(expr: str) -> str:
+            return _ph(_escape_mdv2(_convert_latex_math(expr)))
+
+        text = _convert_math_spans(text, _convert_math_placeholder)
 
         # 3) Convert markdown links – escape the display text; inside the URL
         #    only ')' and '\' need escaping per the MarkdownV2 spec.

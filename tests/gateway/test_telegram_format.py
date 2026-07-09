@@ -37,6 +37,8 @@ _ensure_telegram_mock()
 
 from gateway.platforms.telegram import (  # noqa: E402
     TelegramAdapter,
+    _convert_latex_math,
+    _convert_math_spans,
     _escape_mdv2,
     _strip_mdv2,
     _wrap_markdown_tables,
@@ -1012,3 +1014,169 @@ class TestTelegramGuestMentionGating:
         message.caption_entities = [_guest_mention_entity(text)]
 
         assert adapter._should_process_message(message) is True
+
+
+# =========================================================================
+# LaTeX / math → Unicode
+# =========================================================================
+
+
+class TestConvertLatexMath:
+    def test_greek_symbols(self):
+        assert _convert_latex_math(r'\alpha + \beta') == 'α + β'
+
+    def test_uppercase_greek(self):
+        assert _convert_latex_math(r'\Sigma \Omega') == 'Σ Ω'
+
+    def test_longest_match_first(self):
+        # \varepsilon must win over \epsilon; \geq over \ge
+        assert _convert_latex_math(r'\varepsilon') == 'ε'
+        assert _convert_latex_math(r'\geq') == '≥'
+
+    def test_operators_and_relations(self):
+        assert _convert_latex_math(r'a \times b \neq c') == 'a × b ≠ c'
+        assert _convert_latex_math(r'x \leq y \geq z') == 'x ≤ y ≥ z'
+
+    def test_arrows(self):
+        assert _convert_latex_math(r'a \to b \Rightarrow c') == 'a → b ⇒ c'
+
+    def test_superscript_braced(self):
+        assert _convert_latex_math(r'x^{2}') == 'x²'
+
+    def test_superscript_single(self):
+        assert _convert_latex_math(r'x^2') == 'x²'
+
+    def test_superscript_multichar(self):
+        assert _convert_latex_math(r'e^{-x}') == 'e⁻ˣ'
+
+    def test_subscript_braced(self):
+        assert _convert_latex_math(r'a_{ij}') == 'aᵢⱼ'
+
+    def test_subscript_single(self):
+        assert _convert_latex_math(r'x_1') == 'x₁'
+
+    def test_superscript_unmappable_falls_back(self):
+        # 'Q' has no superscript glyph → keep literal ^Q
+        assert _convert_latex_math(r'x^{Q}') == 'x^Q'
+
+    def test_frac_single_tokens(self):
+        assert _convert_latex_math(r'\frac{a}{b}') == 'a/b'
+
+    def test_frac_multichar(self):
+        assert _convert_latex_math(r'\frac{a+b}{c+d}') == '(a+b)/(c+d)'
+
+    def test_sqrt(self):
+        assert _convert_latex_math(r'\sqrt{2}') == '√(2)'
+
+    def test_mathbb(self):
+        assert _convert_latex_math(r'\mathbb{R}') == 'ℝ'
+
+    def test_mathcal(self):
+        assert _convert_latex_math(r'\mathcal{B}') == 'ℬ'
+        assert _convert_latex_math(r'|\mathcal{C}|\cdot|\mathcal{B}|') == '|𝒞|·|ℬ|'
+
+    def test_escaped_braces_preserved(self):
+        # ``\{ \}`` are literal set-notation braces, not macro delimiters, and
+        # must survive the brace-stripping step as literal ``{ }``.
+        assert _convert_latex_math(r'\{1,\dots,K\}') == '{1,…,K}'
+        assert _convert_latex_math(r'\mathcal{J}=\{(c,b)\}') == '𝒥={(c,b)}'
+
+    def test_textsc_unwrapped(self):
+        assert _convert_latex_math(r'\textsc{std}') == 'std'
+
+    def test_prec_succ(self):
+        assert _convert_latex_math(r'a \prec b \succ c') == 'a ≺ b ≻ c'
+
+    def test_quad_collapses_to_space(self):
+        assert _convert_latex_math(r'k \quad\text{(depth)}') == 'k (depth)'
+        assert _convert_latex_math(r'a \qquad b') == 'a b'
+
+    def test_text_command_unwrapped(self):
+        assert _convert_latex_math(r'\text{hello}') == 'hello'
+
+    def test_infty(self):
+        assert _convert_latex_math(r'\infty') == '∞'
+
+
+class TestConvertMathSpans:
+    def test_display_double_dollar(self):
+        assert _convert_math_spans(r'$$x^2$$') == 'x²'
+
+    def test_display_bracket(self):
+        assert _convert_math_spans(r'\[x^2\]') == 'x²'
+
+    def test_inline_dollar(self):
+        assert _convert_math_spans(r'value $x^2$ here') == 'value x² here'
+
+    def test_inline_paren(self):
+        assert _convert_math_spans(r'value \(x^2\) here') == 'value x² here'
+
+    def test_currency_pair_left_alone(self):
+        # "$5 and $10" — two currency amounts, not a math span
+        text = 'costs $5 and $10 total'
+        assert _convert_math_spans(text) == text
+
+    def test_single_dollar_left_alone(self):
+        text = 'Price is $5.00'
+        assert _convert_math_spans(text) == text
+
+    def test_no_math_markers_noop(self):
+        text = 'plain text with no math'
+        assert _convert_math_spans(text) is text
+
+    def test_empty_span_left_alone(self):
+        text = 'a $ $ b'
+        assert _convert_math_spans(text) == text
+
+
+class TestFormatMessageMath:
+    def test_inline_math_converted(self, adapter):
+        result = adapter.format_message(r'The area is $\pi r^2$ units')
+        assert 'πr²' in result or 'π r²' in result
+
+    def test_math_inside_code_left_alone(self, adapter):
+        result = adapter.format_message(r'use `$x^2$` in code')
+        # Inside inline code the raw LaTeX must survive
+        assert 'x^2' in result
+
+    def test_currency_not_touched(self, adapter):
+        result = adapter.format_message('costs $5 and $10')
+        # Dollar amounts survive (dots/specials still escaped elsewhere)
+        assert '5' in result and '10' in result
+
+    def test_math_result_not_double_escaped(self, adapter):
+        # Converted Unicode is placeholder-stashed; the '=' should be escaped
+        # exactly once by the math step, not again by the safety-net.
+        result = adapter.format_message(r'$a = b$')
+        assert '\\\\=' not in result
+
+
+class TestSanitizeRichMarkdownFormula:
+    # The sendRichMessage path sends raw markdown; Telegram's native formula
+    # render is unreliable across clients, so LaTeX must be transliterated to
+    # Unicode here rather than relying on native rendering.
+    _fn = staticmethod(TelegramAdapter._sanitize_rich_markdown_formula)
+
+    def test_inline_latex_transliterated(self):
+        assert self._fn(r'tách $k$ khỏi $a$') == 'tách k khỏi a'
+
+    def test_mathcal_subseteq(self):
+        got = self._fn(r'job ($E(c)\subseteq\mathcal{B}$, tránh $4\times$)')
+        assert got == 'job (E(c)⊆ℬ, tránh 4×)'
+
+    def test_greek_approx(self):
+        assert self._fn(r'reverse-check $\rho \approx$ ARA') == 'reverse-check ρ ≈ ARA'
+
+    def test_subscript(self):
+        assert self._fn(r'$r_5$ legal validity') == 'r₅ legal validity'
+
+    def test_currency_pairs_preserved(self):
+        text = 'giá $5 và $10 cho combo'
+        assert self._fn(text) == text
+
+    def test_display_math_normalized(self):
+        assert self._fn(r'\[x^2\]') == 'x²'
+
+    def test_no_dollar_noop(self):
+        text = 'plain text no math'
+        assert self._fn(text) == text

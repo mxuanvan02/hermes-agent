@@ -2838,8 +2838,8 @@ class GatewayRunner:
         """Load reasoning effort from config.yaml.
 
         Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
-        default (medium).
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultracode".
+        Returns None to use default (medium).
         """
         from hermes_constants import parse_reasoning_effort
         cfg = _load_gateway_runtime_config()
@@ -7910,6 +7910,7 @@ class GatewayRunner:
         # same session — corrupting the transcript.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        self._update_runtime_status("running")
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
@@ -12056,8 +12057,16 @@ class GatewayRunner:
             return t("gateway.reasoning.reset_done")
         if effort == "none":
             parsed = {"enabled": False}
-        elif effort in {"minimal", "low", "medium", "high", "xhigh"}:
-            parsed = {"enabled": True, "effort": effort}
+        elif effort in {"minimal", "low", "medium", "high", "xhigh", "max", "ultracode"}:
+            if effort in {"max", "ultracode"}:
+                parsed = {
+                    "enabled": True,
+                    "effort": "xhigh",
+                    "requested_effort": effort,
+                    "mode": effort,
+                }
+            else:
+                parsed = {"enabled": True, "effort": effort}
         else:
             return t(
                 "gateway.reasoning.unknown_arg",
@@ -15337,6 +15346,7 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        self._update_runtime_status("draining" if self._draining else "running")
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
@@ -17531,8 +17541,7 @@ class GatewayRunner:
                 )
                 return
             self._running_agents[session_key] = agent_holder[0]
-            if self._draining:
-                self._update_runtime_status("draining")
+            self._update_runtime_status("draining" if self._draining else "running")
         
         tracking_task = asyncio.create_task(track_agent())
         
