@@ -231,6 +231,12 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    if not embedded_rev:
+        try:
+            from hermes_cli.build_info import get_build_sha
+            embedded_rev = get_build_sha(short=0)
+        except Exception:
+            embedded_rev = None
 
     # Read cache — invalidate if the embedded rev has changed since last check
     now = time.time()
