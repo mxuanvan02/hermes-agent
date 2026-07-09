@@ -104,7 +104,7 @@ function terminalFontSizeForWidth(layoutWidthPx: number): number {
 }
 
 function terminalLineHeightForWidth(layoutWidthPx: number): number {
-  return layoutWidthPx < 1024 ? 1.02 : 1.15;
+  return layoutWidthPx < 1024 ? 1.15 : 1.2;
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
@@ -537,13 +537,33 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // (even if fit's cols/rows didn't change, so the PTY has the same
     // dims registered as our JS state — prevents a drift where Ink
     // thinks the terminal is one col bigger than what's on screen).
+    //
+    // Additionally, we await document.fonts.ready so xterm.js measures
+    // cell geometry with the real JetBrains Mono metrics, not the
+    // browser's fallback monospace.  A mismatch here is the primary cause
+    // of text overlap: Ink renders text assuming N columns, but the
+    // terminal's cell width was computed from a wider/narrower fallback
+    // font, so content wraps at the wrong position and lines overwrite
+    // each other.  fonts.ready resolves synchronously when fonts are
+    // already loaded (e.g. hot-reload), so this adds zero latency in the
+    // common case.
     let settleRaf1 = 0;
     let settleRaf2 = 0;
-    settleRaf1 = requestAnimationFrame(() => {
-      settleRaf1 = 0;
-      settleRaf2 = requestAnimationFrame(() => {
-        settleRaf2 = 0;
-        syncTerminalMetrics();
+    void document.fonts.ready.then(() => {
+      if (unmounting) return;
+      settleRaf1 = requestAnimationFrame(() => {
+        settleRaf1 = 0;
+        settleRaf2 = requestAnimationFrame(() => {
+          settleRaf2 = 0;
+          syncTerminalMetrics();
+          // Force an unconditional RESIZE so the PTY grid is in sync with
+          // the JS-side measurement even when fit() computes the same
+          // integer cols/rows as the initial fit (which was measured with
+          // the wrong font metrics before fonts.ready).
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+          }
+        });
       });
     });
 
