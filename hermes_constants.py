@@ -300,13 +300,17 @@ def get_subprocess_home() -> str | None:
     return None
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORT_ALIASES = {
+    "ultracode": "max",
+}
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh",
+    "max", plus the "ultracode" alias that runs at max provider effort.
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none".
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
@@ -316,6 +320,13 @@ def parse_reasoning_effort(effort: str) -> dict | None:
     effort = effort.strip().lower()
     if effort == "none":
         return {"enabled": False}
+    if effort in REASONING_EFFORT_ALIASES:
+        return {
+            "enabled": True,
+            "effort": REASONING_EFFORT_ALIASES[effort],
+            "requested_effort": effort,
+            "mode": effort,
+        }
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
