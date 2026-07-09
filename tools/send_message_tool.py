@@ -251,8 +251,31 @@ def _handle_send(args):
     force_document_attachments = "[[as_document]]" in message
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    media_files, dropped_media = BasePlatformAdapter.filter_media_delivery_paths_ex(media_files)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+
+    # Build a model-facing warning for any dropped attachments. A silently
+    # dropped file is exactly what made past sends look successful when the
+    # attachment never left the gateway — surface the path + reason so the
+    # model can self-correct (e.g. fix a hallucinated/mistyped path) instead
+    # of telling the user "sent" for a file that was never delivered.
+    dropped_warning = None
+    if dropped_media:
+        from gateway.platforms.base import _describe_media_reject_reason
+        details = "; ".join(
+            f"{path} ({_describe_media_reject_reason(reason)})"
+            for path, reason in dropped_media
+        )
+        dropped_warning = f"{len(dropped_media)} attachment(s) were NOT sent: {details}"
+
+        # If nothing deliverable remains (no text, no surviving media), fail
+        # loudly rather than sending an empty/text-only message the model
+        # would mistake for a successful attachment delivery.
+        if not cleaned_message.strip() and not media_files:
+            return tool_error(
+                f"Nothing was sent. {dropped_warning}. "
+                f"Verify the file exists at that exact path before retrying."
+            )
 
     used_home_channel = False
     if not chat_id:
@@ -313,6 +336,13 @@ def _handle_send(args):
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+
+        # Surface dropped-attachment warnings to the model even when the text
+        # send itself succeeded, so it doesn't report a file as delivered.
+        if dropped_warning and isinstance(result, dict):
+            warnings = list(result.get("warnings", []))
+            warnings.append(dropped_warning)
+            result["warnings"] = warnings
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
@@ -850,19 +880,50 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         except Exception:
             _tg_proxy = None
-        if _tg_proxy:
+
+        # media_write_timeout is a SEPARATE PTB timeout that governs the upload
+        # of file bytes in send_document/send_photo/etc. — it is NOT covered by
+        # write_timeout. Its 20s default is far too short for large attachments
+        # over a slow/NAT'd link (a 22 MB zip needs minutes), which silently
+        # surfaced as "Telegram: Timed out" with the file never delivered.
+        # Mirror the gateway adapter's env-tunable timeouts so both send paths
+        # behave identically.
+        def _tg_env_float(name: str, default: float) -> float:
             try:
-                from telegram.request import HTTPXRequest
+                return float(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        _tg_request_kwargs = {
+            "connect_timeout": _tg_env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
+            "read_timeout": _tg_env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
+            "write_timeout": _tg_env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 60.0),
+            "media_write_timeout": _tg_env_float("HERMES_TELEGRAM_HTTP_MEDIA_WRITE_TIMEOUT", 600.0),
+        }
+        # Per-call timeouts applied ONLY to media sends (send_document/photo/...).
+        # read_timeout bounds the wait for Telegram's response AFTER the upload
+        # finishes; its 20s default fires right after a multi-minute large-file
+        # upload completes. Keep these high for media while leaving the bot-wide
+        # read_timeout low so text sends still fail fast.
+        _tg_media_read_timeout = _tg_env_float("HERMES_TELEGRAM_MEDIA_READ_TIMEOUT", 600.0)
+        _tg_media_write_timeout = _tg_request_kwargs["media_write_timeout"]
+
+        try:
+            from telegram.request import HTTPXRequest
+            if _tg_proxy:
                 logger.info("send_message: standalone Telegram send routed through proxy %s", _tg_proxy)
                 bot = Bot(
                     token=token,
-                    request=HTTPXRequest(proxy=_tg_proxy),
-                    get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                    request=HTTPXRequest(proxy=_tg_proxy, **_tg_request_kwargs),
+                    get_updates_request=HTTPXRequest(proxy=_tg_proxy, **_tg_request_kwargs),
                 )
-            except Exception as _proxy_err:
-                logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
-                bot = Bot(token=token)
-        else:
+            else:
+                bot = Bot(token=token, request=HTTPXRequest(**_tg_request_kwargs))
+        except Exception as _bot_err:
+            logger.warning(
+                "send_message: failed to build Telegram bot with custom timeouts (%s), falling back to defaults",
+                _bot_err,
+            )
             bot = Bot(token=token)
         int_chat_id = int(chat_id)
         media_files = media_files or []
@@ -900,48 +961,69 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         warnings = []
 
         if formatted.strip():
+            # Try sendRichMessage (Bot API 10.1) first for native formula/
+            # sup/sub/mark rendering.  Only use raw markdown (not the
+            # MarkdownV2-converted `formatted`) since sendRichMessage handles
+            # standard markdown natively.
             try:
-                last_msg = await _send_telegram_message_with_retry(
-                    bot,
-                    chat_id=int_chat_id, text=formatted,
-                    parse_mode=send_parse_mode, **text_kwargs
-                )
-            except Exception as md_error:
-                # Thread not found — retry without message_thread_id so the
-                # message still delivers (matching the gateway adapter's
-                # fallback behaviour, issue #27012).
-                if _is_telegram_thread_not_found(md_error) and thread_kwargs:
-                    logger.warning(
-                        "Thread %s not found in _send_telegram, retrying without message_thread_id",
-                        thread_kwargs.get("message_thread_id"),
-                    )
-                    text_kwargs.pop("message_thread_id", None)
+                from gateway.platforms.telegram import TelegramAdapter as _TA
+                _sanitized = _TA._sanitize_rich_markdown_formula(message)
+            except Exception:
+                _sanitized = message
+            try:
+                rich_data = {
+                    "chat_id": int_chat_id,
+                    "rich_message": {"markdown": _sanitized},
+                }
+                if text_kwargs.get("message_thread_id") is not None:
+                    rich_data["message_thread_id"] = text_kwargs["message_thread_id"]
+                if disable_link_previews:
+                    rich_data["link_preview_options"] = {"is_disabled": True}
+                last_msg = await bot._post("sendRichMessage", rich_data)
+            except Exception as rich_error:
+                logger.debug("sendRichMessage failed, falling back to send_message: %s", rich_error)
+                try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=formatted,
                         parse_mode=send_parse_mode, **text_kwargs
                     )
-                elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
-                    logger.warning(
-                        "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
-                        send_parse_mode,
-                        _sanitize_error_text(md_error),
-                    )
-                    if not _has_html:
-                        try:
-                            from gateway.platforms.telegram import _strip_mdv2
-                            plain = _strip_mdv2(formatted)
-                        except Exception:
+                except Exception as md_error:
+                    # Thread not found — retry without message_thread_id so the
+                    # message still delivers (matching the gateway adapter's
+                    # fallback behaviour, issue #27012).
+                    if _is_telegram_thread_not_found(md_error) and thread_kwargs:
+                        logger.warning(
+                            "Thread %s not found in _send_telegram, retrying without message_thread_id",
+                            thread_kwargs.get("message_thread_id"),
+                        )
+                        text_kwargs.pop("message_thread_id", None)
+                        last_msg = await _send_telegram_message_with_retry(
+                            bot,
+                            chat_id=int_chat_id, text=formatted,
+                            parse_mode=send_parse_mode, **text_kwargs
+                        )
+                    elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
+                        logger.warning(
+                            "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
+                            send_parse_mode,
+                            _sanitize_error_text(md_error),
+                        )
+                        if not _has_html:
+                            try:
+                                from gateway.platforms.telegram import _strip_mdv2
+                                plain = _strip_mdv2(formatted)
+                            except Exception:
+                                plain = message
+                        else:
                             plain = message
+                        last_msg = await _send_telegram_message_with_retry(
+                            bot,
+                            chat_id=int_chat_id, text=plain,
+                            parse_mode=None, **text_kwargs
+                        )
                     else:
-                        plain = message
-                    last_msg = await _send_telegram_message_with_retry(
-                        bot,
-                        chat_id=int_chat_id, text=plain,
-                        parse_mode=None, **text_kwargs
-                    )
-                else:
-                    raise
+                        raise
 
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
@@ -954,6 +1036,17 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    # Per-call read_timeout for media sends. After the bytes are
+                    # pushed (governed by media_write_timeout on the HTTPXRequest),
+                    # the client still waits for Telegram to ingest the file and
+                    # return the Message object — that wait is bounded by
+                    # read_timeout, whose 20s default is far too short for a large
+                    # file (a 22 MB zip takes ~7 min, so the upload writes for
+                    # ~420s and then read_timeout fires at +20s). Raise it only
+                    # for media so text sends still fail fast on a dead link.
+                    media_kwargs["read_timeout"] = _tg_media_read_timeout
+                    media_kwargs["write_timeout"] = _tg_media_write_timeout
+                    media_kwargs["connect_timeout"] = _tg_request_kwargs["connect_timeout"]
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(
@@ -1019,11 +1112,19 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
+        # sendRichMessage (bot._post) returns a raw dict; send_message/media
+        # sends return a Message object. Extract message_id from either shape,
+        # matching the in-gateway adapter (see gateway/platforms/telegram.py).
+        _mid = (
+            last_msg.get("message_id")
+            if isinstance(last_msg, dict)
+            else getattr(last_msg, "message_id", None)
+        )
         result = {
             "success": True,
             "platform": "telegram",
             "chat_id": chat_id,
-            "message_id": str(last_msg.message_id),
+            "message_id": str(_mid) if _mid is not None else None,
         }
         if warnings:
             result["warnings"] = warnings
