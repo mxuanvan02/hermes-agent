@@ -192,6 +192,149 @@ def test_ttfb_high_env_is_capped_for_openai_codex(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+def _make_third_party_codex_agent(tmp_path, monkeypatch):
+    """Like _make_codex_agent but pointed at a non-OpenAI Codex-compatible
+    router (e.g. nine-router on a LAN IP), so the third-party TTFB tier
+    scaling path is exercised instead of the chatgpt.com branch."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    # Skip the Ollama-style metadata probe: 192.168.x.x is classified as a
+    # local endpoint and the probe would hang in the test sandbox.
+    from agent import model_metadata as _mm
+    from agent import context_compressor as _cc
+
+    monkeypatch.setattr(_mm, "_query_ollama_api_show", lambda *a, **k: None)
+    monkeypatch.setattr(_mm, "_query_local_context_length", lambda *a, **k: None)
+    monkeypatch.setattr(_mm, "detect_local_server_type", lambda *a, **k: None)
+    monkeypatch.setattr(_mm, "get_model_context_length", lambda *a, **k: 272_000)
+    # context_compressor imports get_model_context_length by name.
+    monkeypatch.setattr(_cc, "get_model_context_length", lambda *a, **k: 272_000)
+
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        model="cx/gpt-5.5",
+        provider="nine-router",
+        api_key="sk-dummy",
+        base_url="http://192.168.5.2:20128/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        platform="cli",
+    )
+    agent.api_mode = "codex_responses"
+    monkeypatch.setattr(agent, "_emit_status", lambda *a, **k: None)
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 60.0
+    )
+    return agent
+
+
+def test_ttfb_disabled_for_large_request_on_third_party_codex(tmp_path, monkeypatch):
+    """A large-context request (>25k tokens) on a third-party codex_responses
+    backend must NOT be killed by the flat 12s TTFB watchdog — it should
+    disable the first-byte watchdog and let the backend prefill, since large
+    prefills legitimately take tens of seconds before the first SSE event."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_third_party_codex_agent(tmp_path, monkeypatch)
+    # Short TTFB (2s); large request should disable the watchdog entirely so
+    # a 5s prefill completes instead of being killed at 2s.
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "2")
+    monkeypatch.delenv("HERMES_CODEX_TTFB_STRICT", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_slow_prefill(api_kwargs, client=None, on_first_delta=None):
+        # 5s prefill — longer than the 2s TTFB cutoff would kill at if enabled.
+        time.sleep(5.0)
+        agent._codex_stream_last_event_ts = time.time()
+        if on_first_delta:
+            on_first_delta()
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_prefill)
+
+    # ~133k tokens of input — well above the 25k disable threshold.
+    big_input = "x" * (133_000 * 4)
+    t0 = time.time()
+    resp = h.interruptible_api_call(agent, {"model": "cx/gpt-5.5", "input": big_input})
+    elapsed = time.time() - t0
+    assert resp is sentinel
+    assert "codex_ttfb_kill" not in closes
+    # Completed at ~5s, not killed at 2s.
+    assert elapsed >= 4.5, f"watchdog killed large request at {elapsed:.1f}s"
+
+
+def test_ttfb_tier_scaled_for_mid_size_request_on_third_party_codex(tmp_path, monkeypatch):
+    """A mid-size request on a third-party codex_responses backend must get a
+    tier-scaled TTFB budget instead of the flat 12s default. We raise the
+    disable threshold so the tier-scaling branch is reached, set a low base
+    TTFB, and cap via MAX_SECONDS so the test runs fast while still proving
+    the tier raised the cutoff above the base."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_third_party_codex_agent(tmp_path, monkeypatch)
+    # Raise disable threshold so 60k-token request hits the tier branch.
+    monkeypatch.setenv("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", "200000")
+    # Low base TTFB; tier scaling should raise it (then MAX_SECONDS caps it).
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "2")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "4")
+    monkeypatch.delenv("HERMES_CODEX_TTFB_STRICT", raising=False)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"flag": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    # ~60k tokens → tier 60s, capped to MAX_SECONDS=4s. Without tier scaling
+    # the watchdog would fire at the 2s base. Assert it fires at ~4s instead.
+    mid_input = "x" * (60_000 * 4)
+    t0 = time.time()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "cx/gpt-5.5", "input": mid_input})
+        elapsed = time.time() - t0
+        assert "TTFB threshold: 4s" in str(excinfo.value)
+        assert "codex_ttfb_kill" in closes
+        # Killed around 4s (tier-scaled + capped), not the 2s base.
+        assert elapsed >= 3.5, f"tier scaling not applied, killed at {elapsed:.1f}s"
+        assert elapsed < 10, f"watchdog took too long: {elapsed:.1f}s"
+    finally:
+        stop["flag"] = True
+
+
 def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     """Once a stream event has arrived, a generation that runs past the TTFB
     cutoff is NOT killed by the watchdog — it completes normally."""

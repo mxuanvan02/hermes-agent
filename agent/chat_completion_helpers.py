@@ -314,7 +314,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 12.0)
     if _ttfb_timeout <= 0:
         _ttfb_enabled = False
-    elif _openai_codex_backend:
+    else:
+        # The no-byte TTFB watchdog is disabled for large requests on ALL
+        # codex_responses backends (not just chatgpt.com): large prefills
+        # legitimately spend tens of seconds in backend admission before the
+        # first SSE event, and a flat 12s cutoff would kill healthy
+        # large-context requests on third-party Codex-compatible routers
+        # (e.g. nine-router). The stream-idle watchdog + HERMES_API_TIMEOUT
+        # still catch true silent hangs. Set HERMES_CODEX_TTFB_STRICT=1 to
+        # force early reconnects regardless of request size.
         _ttfb_disable_above = _env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 25_000.0)
         _ttfb_strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
             "1", "true", "yes", "on"
@@ -326,13 +334,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
         ):
             _ttfb_enabled = False
             logger.info(
-                "Disabling openai-codex no-byte TTFB watchdog for large request "
-                "(context=~%s tokens >= %.0f). Waiting for backend response instead. "
-                "Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
+                "Disabling codex no-byte TTFB watchdog for large request "
+                "(context=~%s tokens >= %.0f, backend=%s). Waiting for backend "
+                "response instead. Set HERMES_CODEX_TTFB_STRICT=1 to force early reconnects.",
                 f"{_est_tokens_for_codex_watchdog:,}",
                 _ttfb_disable_above,
+                "openai" if _openai_codex_backend else "third-party",
             )
-        else:
+        elif _openai_codex_backend:
             _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 20.0)
             if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
                 logger.info(
@@ -343,6 +352,33 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"{_est_tokens_for_codex_watchdog:,}",
                 )
                 _ttfb_timeout = _ttfb_cap
+        elif not _ttfb_strict:
+            # Third-party codex_responses backends (e.g. nine-router): scale
+            # the first-byte budget by estimated request size so mid-size
+            # prefills (below the disable threshold) aren't killed at the
+            # flat 12s default. Mirrors the stream-idle tier scaling below.
+            if _est_tokens_for_codex_watchdog > 100_000:
+                _scaled_ttfb = 120.0
+            elif _est_tokens_for_codex_watchdog > 50_000:
+                _scaled_ttfb = 60.0
+            elif _est_tokens_for_codex_watchdog > 25_000:
+                _scaled_ttfb = 30.0
+            else:
+                _scaled_ttfb = _ttfb_timeout
+            _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+            if _ttfb_cap > 0 and _scaled_ttfb > _ttfb_cap:
+                _scaled_ttfb = _ttfb_cap
+            if _scaled_ttfb > _ttfb_timeout:
+                logger.info(
+                    "Scaling third-party codex no-byte TTFB timeout from %.0fs to "
+                    "%.0fs (context=~%s tokens, tier-based). Set "
+                    "HERMES_CODEX_TTFB_TIMEOUT_SECONDS to override, "
+                    "HERMES_CODEX_TTFB_STRICT=1 to disable scaling.",
+                    _ttfb_timeout,
+                    _scaled_ttfb,
+                    f"{_est_tokens_for_codex_watchdog:,}",
+                )
+                _ttfb_timeout = _scaled_ttfb
 
     _codex_idle_enabled = _codex_watchdog_enabled
     _codex_idle_timeout = _env_float(
@@ -692,9 +728,9 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     if agent.provider_data_collection:
         _prefs["data_collection"] = agent.provider_data_collection
 
-    # Claude max-output override on aggregators
+    # Claude max-output override on aggregators and custom providers
     _ant_max = None
-    if (_is_or or _is_nous) and "claude" in (agent.model or "").lower():
+    if (_is_or or _is_nous or "9router" in (agent.provider or "") or "custom" in (agent.provider or "")) and "claude" in (agent.model or "").lower():
         try:
             from agent.anthropic_adapter import _get_anthropic_max_output
             _ant_max = _get_anthropic_max_output(agent.model)
@@ -1144,14 +1180,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
 
-        # Clear the per-config context_length override so the fallback
-        # model's actual context window is resolved instead of inheriting
-        # the stale value from the previous model.  See #22387.
         agent._config_context_length = None
         agent.model = fb_model
         agent.provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        # Clear/update max_tokens for the fallback model to prevent inheriting incompatible limits
+        # and instead fall back to the model's native limit (resolved dynamically).
+        agent.max_tokens = fb.get("max_tokens")
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -1672,6 +1708,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    try:
+        _stream_max_duration = float(os.getenv("HERMES_STREAM_MAX_DURATION", "300"))
+    except (TypeError, ValueError):
+        _stream_max_duration = 300.0
 
     def _fire_first_delta():
         if not first_delta_fired["done"] and on_first_delta:
@@ -1786,6 +1826,35 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     pass
             except Exception:
                 pass
+
+            if _stream_max_duration > 0:
+                _started = float(_diag.get("started_at") or last_chunk_time["t"])
+                _elapsed = time.time() - _started
+                if _elapsed > _stream_max_duration:
+                    _msg = (
+                        f"stream exceeded max duration "
+                        f"({_elapsed:.0f}s > {_stream_max_duration:.0f}s)"
+                    )
+                    logger.warning(
+                        "Stream exceeded max duration %.0fs for model=%s; "
+                        "chunks=%s bytes=%s. Killing connection.",
+                        _stream_max_duration,
+                        api_kwargs.get("model", "unknown"),
+                        _diag.get("chunks"),
+                        _diag.get("bytes"),
+                    )
+                    try:
+                        agent._emit_status(
+                            f"⚠️ Provider stream exceeded "
+                            f"{int(_stream_max_duration)}s; reconnecting."
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        _close_request_client_once("stream_max_duration_kill")
+                    except Exception:
+                        pass
+                    raise _httpx.ReadTimeout(_msg)
 
             if agent._interrupt_requested:
                 break
