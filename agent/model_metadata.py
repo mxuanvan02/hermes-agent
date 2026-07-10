@@ -153,6 +153,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude": 200000,
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
     # Source: https://developers.openai.com/api/docs/models
+    # GPT-5.6 (launched Jul 9 2026) ships as Sol/Terra/Luna tiers.
+    # Direct API: 272K context. Codex OAuth caps at 272K as well.
+    "gpt-5.6-sol": 272000,
+    "gpt-5.6-terra": 272000,
+    "gpt-5.6-luna": 272000,
     # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
     # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
     # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
