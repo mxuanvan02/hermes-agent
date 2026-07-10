@@ -204,6 +204,15 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://platform.minimax.io/docs/api-reference/text-anthropic-api
     "minimax": 204800,
     # GLM
+    # GLM-5.2 default (free tier, no [1m] suffix) = 202,752 tokens (~200K).
+    # The 1M context window (1,048,576) is opt-in via the "glm-5.2[1m]"
+    # model identifier and requires a paid GLM Coding Plan. Both entries
+    # must precede the generic "glm" key (202,752) so longest-first
+    # substring matching picks the right one:
+    #   "glm-5.2[1m]" → 1M (paid), "glm-5.2"/"glm-5-2" → 200K (free).
+    "glm-5.2[1m]": 1048576,
+    "glm-5.2": 202752,
+    "glm-5-2": 202752,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Hermes from probing-down to
