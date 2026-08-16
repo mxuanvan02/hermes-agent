@@ -203,7 +203,24 @@ def _get_capability_backend(capability: str) -> str:
 
 
 def _is_backend_available(backend: str) -> bool:
-    """Return True when the selected backend is currently usable."""
+    """Return True when the selected backend is currently usable.
+
+    Plugin-registered providers are consulted first so a backend name that
+    only exists as a plugin (e.g. ``9router``) is not misreported as
+    unavailable. Without this, ``_get_capability_backend()`` discards a
+    valid ``web.search_backend`` value and the dispatcher silently falls
+    back to the legacy default, producing a "set FIRECRAWL_API_KEY" error
+    even though the configured provider is registered and ready.
+    """
+    try:
+        from agent.web_search_registry import get_provider as _wsp_get_provider
+
+        provider = _wsp_get_provider(backend)
+        if provider is not None:
+            return bool(provider.is_available())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("registry availability probe failed for %s: %s", backend, exc)
+
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":

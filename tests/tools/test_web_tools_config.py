@@ -324,6 +324,36 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "Tavily"}):
             assert _get_backend() == "tavily"
 
+    def test_capability_backend_accepts_available_plugin_provider(self):
+        """A configured plugin-only backend must not be discarded."""
+        from tools.web_tools import _get_capability_backend
+
+        provider = MagicMock()
+        provider.is_available.return_value = True
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"search_backend": "custom-plugin"},
+        ), patch(
+            "agent.web_search_registry.get_provider",
+            return_value=provider,
+        ):
+            assert _get_capability_backend("search") == "custom-plugin"
+
+    def test_capability_backend_rejects_unavailable_plugin_provider(self):
+        """An unavailable plugin backend must preserve legacy fallback."""
+        from tools.web_tools import _get_capability_backend
+
+        provider = MagicMock()
+        provider.is_available.return_value = False
+        with patch(
+            "tools.web_tools._load_web_config",
+            return_value={"search_backend": "custom-plugin"},
+        ), patch(
+            "agent.web_search_registry.get_provider",
+            return_value=provider,
+        ):
+            assert _get_capability_backend("search") == "firecrawl"
+
     # ── Fallback (no web.backend in config) ───────────────────────────
 
     def test_fallback_parallel_only_key(self):
