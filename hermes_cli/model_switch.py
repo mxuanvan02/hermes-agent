@@ -595,7 +595,20 @@ def resolve_display_context_length(
 
     Prefer the provider-aware value; fall back to ``model_info.context_window``
     only if the resolver returns nothing.
+
+    When ``custom_providers`` is omitted the compatible view is derived from
+    config.yaml here. Callers that forgot to thread it through used to fall all
+    the way to the 256K default fallback and print a context window the agent
+    was not actually running at — the CLI ``/model`` confirmation did exactly
+    that while the gateway path, which passes the argument, printed the right
+    number for the same model.
     """
+    if custom_providers is None:
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers()
+        except Exception:
+            custom_providers = None
     try:
         from agent.model_metadata import get_model_context_length
         ctx = get_model_context_length(
