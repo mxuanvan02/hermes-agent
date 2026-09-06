@@ -13879,9 +13879,16 @@ class GatewayRunner:
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
         thread_id = getattr(source, "thread_id", None)
-        if thread_id is None:
+        metadata: Dict[str, Any] = {}
+        if thread_id is not None:
+            metadata["thread_id"] = thread_id
+        if (
+            getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(source, "user_id", None)
+        ):
+            metadata["discord_mention_user_id"] = str(source.user_id)
+        if not metadata:
             return None
-        metadata: Dict[str, Any] = {"thread_id": thread_id}
         if (
             getattr(source, "platform", None) == Platform.TELEGRAM
             and getattr(source, "chat_type", None) == "dm"
