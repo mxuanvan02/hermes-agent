@@ -624,6 +624,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # per channel.  Two agents that @mention each other can otherwise
         # ping-pong forever; this caps the exchange rate per rolling window.
         self._bot_exchange_times: Dict[str, List[float]] = defaultdict(list)
+        # Consecutive bot-authored messages accepted in a channel with no human
+        # message in between.  The rate limit above only slows a runaway
+        # exchange down; this ends it, and only a human posting in the room
+        # clears it.
+        self._bot_chain_counts: Dict[str, int] = defaultdict(int)
+        # Channels where the chain limit has already been reported, so the log
+        # carries one warning per runaway exchange instead of one per message.
+        self._bot_chain_reported: set = set()
         # Set when Discord rejects the Server Members privileged intent so the
         # next connect() attempt drops it instead of failing to come online.
         self._members_intent_blocked: bool = False
@@ -814,9 +822,28 @@ class DiscordAdapter(BasePlatformAdapter):
                             getattr(message.author, "display_name", None) or message.author,
                         )
                         return
+                    # End the exchange outright once it has run for several
+                    # turns with no human in it.  The rate limit above only
+                    # slows the loop; this stops it until someone speaks.
+                    _chain_channel_id = str(message.channel.id)
+                    if not adapter_self._discord_bot_chain_allowed(_chain_channel_id):
+                        if _chain_channel_id not in adapter_self._bot_chain_reported:
+                            adapter_self._bot_chain_reported.add(_chain_channel_id)
+                            logger.warning(
+                                "[%s] Bot-to-bot chain limit reached in channel %s — "
+                                "staying silent until a human posts (last sender: %s)",
+                                adapter_self.name,
+                                message.channel.id,
+                                getattr(message.author, "display_name", None) or message.author,
+                            )
+                        return
                     # "all" falls through; bot is permitted — skip the
                     # human-user allowlist below (bots aren't in it).
                 else:
+                    # A human spoke: the bot-to-bot chain is over, so clear the
+                    # counter before the allowlist check (an ignored human still
+                    # proves the room is not a runaway loop).
+                    adapter_self._discord_note_human_message(str(message.channel.id))
                     # Non-bot: enforce the configured user/role allowlists.
                     # Pass guild + is_dm so role checks are scoped to the
                     # originating guild (prevents cross-guild DM bypass, see
@@ -3970,6 +3997,38 @@ class DiscordAdapter(BasePlatformAdapter):
         recent.append(now)
         self._bot_exchange_times[channel_id] = recent
         return True
+
+    def _discord_bot_chain_allowed(self, channel_id: str) -> bool:
+        """Stop an unbroken run of bot-to-bot replies in a channel.
+
+        The rate limit in :meth:`_discord_bot_exchange_allowed` only throttles a
+        runaway exchange: once its window slides past, both agents resume and
+        the loop continues indefinitely at a slower pace.  This counts
+        *consecutive* bot messages with no human message in between and stops
+        answering past ``DISCORD_BOT_CHAIN_LIMIT`` turns.  The counter is
+        cleared by :meth:`_discord_note_human_message`, so a person joining the
+        conversation reopens it — which is what makes this a chain breaker
+        rather than a second rate limit.
+        """
+        try:
+            limit = int(os.getenv("DISCORD_BOT_CHAIN_LIMIT", "4"))
+        except (TypeError, ValueError):
+            limit = 4
+        if limit <= 0:
+            return False
+
+        count = self._bot_chain_counts[channel_id] + 1
+        if count > limit:
+            self._bot_chain_counts[channel_id] = limit + 1
+            return False
+        self._bot_chain_counts[channel_id] = count
+        self._bot_chain_reported.discard(channel_id)
+        return True
+
+    def _discord_note_human_message(self, channel_id: str) -> None:
+        """Reset the bot-to-bot chain because a human spoke in this room."""
+        self._bot_chain_counts.pop(channel_id, None)
+        self._bot_chain_reported.discard(channel_id)
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
