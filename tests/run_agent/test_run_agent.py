@@ -1188,10 +1188,21 @@ class TestToolUseEnforcementConfig:
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
 
     def test_auto_skips_for_claude(self):
-        from agent.prompt_builder import TOOL_USE_ENFORCEMENT_GUIDANCE
+        from agent.prompt_builder import (
+            CLAUDE_TOOL_USE_GUIDANCE,
+            TOOL_USE_ENFORCEMENT_GUIDANCE,
+        )
         agent = self._make_agent(model="anthropic/claude-sonnet-4", tool_use_enforcement="auto")
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+        assert CLAUDE_TOOL_USE_GUIDANCE in prompt
+
+    def test_false_disables_claude_specific_guidance(self):
+        from agent.prompt_builder import CLAUDE_TOOL_USE_GUIDANCE
+        agent = self._make_agent(
+            model="anthropic/claude-sonnet-4", tool_use_enforcement=False
+        )
+        assert CLAUDE_TOOL_USE_GUIDANCE not in agent._build_system_prompt()
 
     def test_auto_injects_for_grok(self):
         """xAI Grok / xai-oauth models hit the same enforcement path as GPT."""

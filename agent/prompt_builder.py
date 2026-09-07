@@ -262,6 +262,20 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
+# Claude-specific guidance is intentionally separate from the generic policy.
+# Some Claude-compatible routes occasionally emit Hermes's ``Skill/tool:``
+# narration format as plain text and stop instead of producing a structured
+# tool call.  Naming that exact failure mode is more effective and less likely
+# to perturb unrelated model families.
+CLAUDE_TOOL_USE_GUIDANCE = (
+    "# Claude tool-call completion discipline\n"
+    "When tools are available, a line beginning with `Skill/tool:` is narration, "
+    "not a completed action. Never return such a line as a text-only final response. "
+    "Emit the corresponding structured tool call in that same response, wait for its "
+    "result, and continue until the requested work is complete. Only finish with plain "
+    "text when reporting verified results or a concrete blocker."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
@@ -1409,6 +1423,57 @@ def _load_cursorrules(cwd_path: Path) -> str:
     return _truncate_content(cursorrules_content, ".cursorrules")
 
 
+_ECC_CONTEXT_MODES = ("dev", "research", "review")
+
+
+def _load_ecc_context() -> str:
+    """Load ``ECC/contexts/<mode>.md`` when ``ECC_CONTEXT`` names a mode.
+
+    Opt-in on purpose: with no env var set nothing is injected, so default
+    prompt assembly is byte-identical to before. ``ECC/contexts`` is three
+    small files (~1.5KB total) describing a working posture -- research mode,
+    for instance, asks for evidence before conclusions. ``ECC/rules`` is
+    ~280KB across 23 language sets and is deliberately not loaded here; it
+    belongs behind a per-language selector, not in every system prompt.
+    """
+    mode = os.environ.get("ECC_CONTEXT", "").strip().lower()
+    if mode not in _ECC_CONTEXT_MODES:
+        return ""
+    # A runtime profile (HERMES_HOME/ecc) carries the command catalog but not
+    # necessarily the shared contexts/ tree, so fall back to the checkout the
+    # module points at. Runtime wins when it does ship its own copy.
+    roots: list[Path] = []
+    try:
+        from agent.ecc_commands import (
+            _DEFAULT_ECC_COMMANDS_DIR,
+            _configured_commands_dir,
+        )
+
+        roots.append(_configured_commands_dir().parent)
+        roots.append(_DEFAULT_ECC_COMMANDS_DIR.parent)
+    except Exception as exc:
+        logger.debug("Could not resolve ECC root for context %s: %s", mode, exc)
+        return ""
+
+    content = ""
+    for root in roots:
+        path = root / "contexts" / f"{mode}.md"
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if content:
+            break
+    if not content:
+        logger.debug("No ECC context file found for mode %s in %s", mode, roots)
+        return ""
+    # Same untrusted-content treatment as every other context file.
+    content = _scan_context_content(content, f"ECC/contexts/{mode}.md")
+    return _truncate_content(
+        f"## ECC Context: {mode}\n\n{content}\n", f"ECC/contexts/{mode}.md"
+    )
+
+
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
     """Discover and load context files for the system prompt.
 
@@ -1439,6 +1504,12 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     )
     if project_context:
         sections.append(project_context)
+
+    # ECC mode context (opt-in via ECC_CONTEXT). Independent of the
+    # priority chain above: it describes *how* to work, not project facts.
+    ecc_context = _load_ecc_context()
+    if ecc_context:
+        sections.append(ecc_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:

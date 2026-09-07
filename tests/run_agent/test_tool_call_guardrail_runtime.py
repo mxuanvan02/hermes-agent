@@ -268,6 +268,71 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+def test_claude_skill_tool_text_is_retried_once_then_executes_tool():
+    agent = _make_agent("terminal", max_iterations=4)
+    agent.model = "claude-opus-5"
+    responses = [
+        _mock_response(
+            content="Skill/tool: terminal — dọn tệp tạm rồi xác minh trạng thái cuối.",
+            finish_reason="stop",
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", '{"command":"true"}', "c-clean")],
+        ),
+        _mock_response(content="Đã dọn và xác minh xong.", finish_reason="stop"),
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("run_agent.handle_function_call", return_value='{"ok":true}') as call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("xong rồi thì nghiệm thu")
+
+    call.assert_called_once()
+    assert result["api_calls"] == 3
+    assert result["final_response"] == "Đã dọn và xác minh xong."
+    assert not any(
+        msg.get("_claude_tool_promise_recovery") for msg in result["messages"]
+    )
+
+
+def test_claude_skill_tool_recovery_does_not_loop_twice():
+    agent = _make_agent("terminal", max_iterations=4)
+    agent.model = "claude-opus-5"
+    promise = "Skill/tool: terminal — dọn tệp tạm rồi xác minh trạng thái cuối."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content=promise, finish_reason="stop"),
+        _mock_response(content=promise, finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("continue")
+
+    assert result["api_calls"] == 2
+    assert result["final_response"] == promise
+
+
+def test_claude_detector_ignores_summary_and_other_model_families():
+    agent = _make_agent("terminal")
+    agent.model = "claude-opus-5"
+    assert not agent._looks_like_claude_tool_promise(
+        "Đã hoàn tất. Skill/tool: terminal đã dùng để xác minh."
+    )
+    agent.model = "gpt-5.4"
+    assert not agent._looks_like_claude_tool_promise(
+        "Skill/tool: terminal — run tests next."
+    )
+
+
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}

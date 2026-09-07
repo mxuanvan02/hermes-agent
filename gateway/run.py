@@ -7475,6 +7475,21 @@ class GatewayRunner:
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
+        # ECC commands are a dynamic workflow catalog, not native Hermes
+        # commands. Resolve them before the built-in/plugin/skill fallbacks so
+        # canonical ``/ecc:<slug>`` and Telegram-safe ``/ecc_<slug>`` names
+        # enter the normal agent turn instead of the unknown-command guard.
+        _ecc_entry = None
+        if command:
+            try:
+                from agent.ecc_commands import resolve_ecc_command as _resolve_ecc
+
+                _ecc_entry = _resolve_ecc(command)
+                if _ecc_entry:
+                    canonical = str(_ecc_entry["canonical"])
+            except Exception as _ecc_exc:
+                logger.debug("ECC command lookup failed (non-fatal): %s", _ecc_exc)
+
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
         # Preserve built-in precedence; aliases only need early handling when
@@ -7503,7 +7518,7 @@ class GatewayRunner:
         # run every command. When set → non-admins can run only commands in
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
-        if command and canonical and is_gateway_known_command(canonical):
+        if command and canonical and (is_gateway_known_command(canonical) or _ecc_entry):
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
                 return _denied
@@ -7781,6 +7796,27 @@ class GatewayRunner:
                 else:
                     return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
 
+        # Dynamic ECC workflow commands load inert Markdown into the agent
+        # prompt. The workflow itself is never executed as shell code.
+        if _ecc_entry:
+            try:
+                from agent.ecc_commands import build_ecc_command_message
+
+                _ecc_message = build_ecc_command_message(
+                    command,
+                    event.get_command_args().strip(),
+                    task_id=_quick_key,
+                )
+            except Exception as _ecc_exc:
+                logger.warning("ECC command dispatch failed: %s", _ecc_exc)
+                return "ECC workflow could not be loaded."
+            if _ecc_message:
+                event.text = _ecc_message
+                # Skip all slash-command fallbacks and enter the normal agent
+                # path below with the expanded workflow as the user turn.
+                command = None
+                canonical = None
+
         # Plugin-registered slash commands
         if command:
             try:
@@ -7881,6 +7917,27 @@ class GatewayRunner:
                             command,
                             source.platform.value if source.platform else "?",
                         )
+                        # Offer close matches from the real catalogs so a typo
+                        # or a partially-typed name still lands the user on the
+                        # command they meant. Suggestions never auto-dispatch.
+                        _suggestions: list[str] = []
+                        try:
+                            from hermes_cli.commands import suggest_commands
+
+                            _suggestions = suggest_commands(command)
+                        except Exception as _sug_exc:
+                            logger.debug(
+                                "Command suggestion failed (non-fatal): %s", _sug_exc
+                            )
+                        if _suggestions:
+                            _did_you_mean = "\n".join(
+                                f"• `/{name}`" for name in _suggestions
+                            )
+                            return (
+                                f"Unknown command `/{command}`. Did you mean:\n"
+                                f"{_did_you_mean}\n\n"
+                                f"Type /commands for the full list."
+                            )
                         return (
                             f"Unknown command `/{command}`. "
                             f"Type /commands to see what's available, "

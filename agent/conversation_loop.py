@@ -721,6 +721,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    claude_tool_promise_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     max_truncated_tool_call_retries = 3
@@ -4273,6 +4274,33 @@ def run_conversation(
                 agent._clear_status_buffer()
 
                 if (
+                    finish_reason == "stop"
+                    and claude_tool_promise_continuations < 1
+                    and agent._looks_like_claude_tool_promise(final_response)
+                ):
+                    claude_tool_promise_continuations += 1
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message, "incomplete"
+                    )
+                    interim_msg["_claude_tool_promise_recovery"] = True
+                    messages.append(interim_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[System: Your `Skill/tool:` line described an action but did "
+                            "not execute it. Emit the structured tool call now, process its "
+                            "result, and only then send the final answer.]"
+                        ),
+                        "_claude_tool_promise_recovery": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "Claude returned text-only Skill/tool narration; "
+                        "nudging once for a structured tool call"
+                    )
+                    continue
+
+                if (
                     agent.api_mode == "codex_responses"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
@@ -4308,6 +4336,17 @@ def run_conversation(
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+
+                # The Claude recovery exchange is provider scaffolding, not
+                # durable conversation history.  The model has already seen it
+                # for the retry, so remove it before persistence.
+                messages[:] = [
+                    msg for msg in messages
+                    if not (
+                        isinstance(msg, dict)
+                        and msg.get("_claude_tool_promise_recovery")
+                    )
+                ]
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending the final response.  These

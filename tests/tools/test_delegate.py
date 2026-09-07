@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -69,6 +70,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("agent_name", props)
+        self.assertIn("agent_name", props["tasks"]["items"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -137,6 +140,43 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("CONTEXT", prompt)
         self.assertIn("assertion failed", prompt)
+
+    def test_agent_definition_is_included_in_prompt(self):
+        prompt = _build_child_system_prompt(
+            "Create the plan",
+            agent_definition="---\nname: planner\n---\n\n## Your Role\nPlan carefully.",
+        )
+        self.assertIn("ECC AGENT DEFINITION", prompt)
+        self.assertIn("name: planner", prompt)
+        self.assertIn("Plan carefully.", prompt)
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_agent_definition_maps_model_and_reaches_child(self, _mock_cfg, MockAgent):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        definition = SimpleNamespace(
+            name="planner",
+            model="opus",
+            raw="---\nname: planner\n---\n\nPlan carefully.",
+        )
+
+        _build_child_agent(
+            task_index=0,
+            goal="Create the plan",
+            context=None,
+            toolsets=None,
+            model="gpt-5.6-terra",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            agent_name="planner",
+            agent_definition=definition,
+        )
+
+        call_kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "gpt-5.6-sol")
+        self.assertIn("Plan carefully.", call_kwargs["ephemeral_system_prompt"])
 
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")

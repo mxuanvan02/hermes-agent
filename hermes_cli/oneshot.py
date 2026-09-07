@@ -140,13 +140,6 @@ def run_oneshot(
 
     Returns the exit code.  Caller should sys.exit() with the return.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
-
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
@@ -176,6 +169,19 @@ def run_oneshot(
     real_stdout = sys.stdout
     devnull = open(os.devnull, "w", encoding="utf-8")
 
+    # Silence every stdlib logger for the duration.  AIAgent, tools, and
+    # provider adapters all log to stderr through the root logger; file
+    # handlers added by setup_logging() keep working (they're attached to
+    # the root logger's handler list, not affected by level), but no
+    # bytes reach the terminal.
+    #
+    # logging.disable() is process-global and has no scope of its own, so the
+    # previous level is captured and restored below.  Leaving it set leaks into
+    # anything else running in this interpreter -- most visibly a test session,
+    # where every later assertLogs/caplog assertion sees no records at all.
+    _prev_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             response = _run_agent(
@@ -186,6 +192,7 @@ def run_oneshot(
                 use_config_toolsets=use_config_toolsets,
             )
     finally:
+        logging.disable(_prev_logging_disable)
         try:
             devnull.close()
         except Exception:

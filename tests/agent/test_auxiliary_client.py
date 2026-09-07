@@ -1525,6 +1525,54 @@ class TestAuxiliaryFallbackLayering:
         ), f"Expected exhaustion warning, got: {[r.message for r in caplog.records]}"
 
 
+class TestConfiguredFallbackResolution:
+    """Configured fallback entries resolve through the shared provider router."""
+
+    def test_forwards_explicit_endpoint_credentials(self):
+        from agent.auxiliary_client import _resolve_single_provider
+
+        fake_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, "fallback-model"),
+        ) as resolve:
+            client = _resolve_single_provider(
+                "custom-fallback",
+                "fallback-model",
+                "https://fallback.example/v1",
+                "fallback-key",
+            )
+
+        assert client is fake_client
+        resolve.assert_called_once_with(
+            provider="custom-fallback",
+            model="fallback-model",
+            explicit_base_url="https://fallback.example/v1",
+            explicit_api_key="fallback-key",
+        )
+
+    def test_resolves_named_provider_from_providers_dict(self):
+        from agent.auxiliary_client import _resolve_single_provider
+
+        config = {
+            "providers": {
+                "local-proxy": {
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "api_key": "local-key",
+                    "api_mode": "chat_completions",
+                }
+            }
+        }
+        with patch("hermes_cli.runtime_provider.load_config", return_value=config):
+            client = _resolve_single_provider(
+                "local-proxy",
+                "fallback-model",
+            )
+
+        assert client is not None
+        assert str(client.base_url).rstrip("/") == "http://127.0.0.1:8080/v1"
+
+
 class TestTryMainAgentModelFallback:
     """_try_main_agent_model_fallback resolves the user's main provider+model as a safety net."""
 

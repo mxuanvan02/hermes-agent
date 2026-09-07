@@ -70,6 +70,29 @@ class TestGetDefaultHermesRoot:
         assert get_default_hermes_root() == docker_root
 
 
+class TestGetSubprocessHome:
+    """Tests for optional per-profile HOME isolation in subprocesses."""
+
+    def test_profile_home_is_used_by_default(self, tmp_path, monkeypatch):
+        """Existing profile isolation remains enabled when not opted out."""
+        hermes_home = tmp_path / "hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_DISABLE_SUBPROCESS_HOME", raising=False)
+
+        assert hermes_constants.get_subprocess_home() == str(profile_home)
+
+    def test_explicit_opt_out_preserves_user_home(self, tmp_path, monkeypatch):
+        """HERMES_DISABLE_SUBPROCESS_HOME=1 disables the HOME override."""
+        hermes_home = tmp_path / "hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_DISABLE_SUBPROCESS_HOME", "1")
+
+        assert hermes_constants.get_subprocess_home() is None
+
+
 class TestIsContainer:
     """Tests for is_container() — Docker/Podman detection."""
 

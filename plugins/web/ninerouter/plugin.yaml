@@ -1,0 +1,7 @@
+name: web-9router
+version: 1.0.0
+description: "9Router web search and fetch bridge. Uses local 9Router /v1/search and /v1/web/fetch providers such as Tavily, Exa, Jina Reader, and Firecrawl. Requires NINEROUTER_API_KEY."
+author: NousResearch
+kind: backend
+provides_web_providers:
+  - 9router

@@ -136,6 +136,14 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 _MIN_SPAWN_DEPTH = 1
 _MAX_SPAWN_DEPTH_CAP = 3
 
+# ECC frontmatter uses Claude-style capability names.  Hermes installations
+# route those roles to the local GPT model tiers requested by the operator.
+_ECC_AGENT_MODEL_MAP = {
+    "opus": "gpt-5.6-sol",
+    "sonnet": "gpt-5.6-terra",
+    "haiku": "gpt-5.6-luna",
+}
+
 
 # ---------------------------------------------------------------------------
 # Runtime state: pause flag + active subagent registry
@@ -574,6 +582,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    agent_definition: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -590,6 +599,8 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
+    if agent_definition:
+        parts.append(f"\n## ECC AGENT DEFINITION\n{agent_definition}")
     if workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
@@ -888,6 +899,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    agent_name: Optional[str] = None,
+    agent_definition=None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -900,6 +913,21 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
     import uuid as _uuid
+
+    # Load the installed ECC definition lazily so existing delegation calls do
+    # not pay the filesystem cost and unknown names fail explicitly.
+    if agent_name and agent_definition is None:
+        from agent.agent_definitions import load_agent_definition_metadata
+
+        agent_definition = load_agent_definition_metadata(agent_name)
+
+    definition_model = getattr(agent_definition, "model", None)
+    if definition_model:
+        definition_model_key = str(definition_model).strip().lower()
+        model = _ECC_AGENT_MODEL_MAP.get(definition_model_key, model)
+    definition_raw = getattr(agent_definition, "raw", agent_definition)
+    if definition_raw is not None and not isinstance(definition_raw, str):
+        definition_raw = str(definition_raw)
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
@@ -975,6 +1003,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        agent_definition=definition_raw,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1925,6 +1954,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     parent_agent=None,
+    agent_name: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2017,7 +2047,13 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "agent_name": agent_name,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2080,6 +2116,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                agent_name=t.get("agent_name"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2635,6 +2672,34 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_agent_name_param_description() -> str:
+    """Describe ``agent_name`` using the definitions actually installed.
+
+    Two hardcoded examples left the other installed definitions effectively
+    invisible: the model cannot pick a specialist it was never told about, so
+    ``mle-reviewer``, ``silent-failure-hunter``, ``spec-miner`` and the rest
+    went unused while every delegation defaulted to a generic worker. Listing
+    real names is also self-correcting — an uninstalled definition can no
+    longer be suggested, because the list comes from the filesystem.
+    """
+    base = (
+        "Installed ECC agent definition to apply to this child. "
+        "Applies that agent's specialist prompt, tool restrictions, and model."
+    )
+    try:
+        from agent.agent_definitions import list_agent_definitions
+
+        names = list_agent_definitions()
+    except Exception:
+        names = []
+    if not names:
+        return f"{base} No definitions are installed, so leave this unset."
+    return (
+        f"{base} Pick the closest match by specialty; omit it for a generic "
+        f"worker. Installed ({len(names)}): {', '.join(names)}."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -2651,6 +2716,23 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+
+    agent_name_desc = _build_agent_name_param_description()
+    overrides_params["properties"]["agent_name"] = {
+        **overrides_params["properties"]["agent_name"],
+        "description": agent_name_desc,
+    }
+    # ``tasks`` carries its own per-task agent_name. Rebuild the nested chain
+    # by hand — the copy above is shallow, so mutating items/properties in
+    # place would leak back into the static schema.
+    tasks_schema = overrides_params["properties"]["tasks"]
+    tasks_items = dict(tasks_schema.get("items", {}))
+    tasks_item_props = {k: dict(v) for k, v in tasks_items.get("properties", {}).items()}
+    if "agent_name" in tasks_item_props:
+        tasks_item_props["agent_name"]["description"] = agent_name_desc
+        tasks_items["properties"] = tasks_item_props
+        tasks_schema["items"] = tasks_items
+
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -2736,6 +2818,13 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "agent_name": {
+                            "type": "string",
+                            "description": (
+                                "Installed ECC agent definition to apply to this task, "
+                                "for example 'planner' or 'security-reviewer'."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2748,6 +2837,13 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "agent_name": {
+                "type": "string",
+                "description": (
+                    "Installed ECC agent definition to apply to this child, "
+                    "for example 'planner' or 'security-reviewer'."
+                ),
             },
             "acp_command": {
                 "type": "string",
@@ -2794,6 +2890,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         parent_agent=kw.get("parent_agent"),
+        agent_name=args.get("agent_name"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

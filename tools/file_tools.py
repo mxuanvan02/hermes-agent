@@ -173,6 +173,17 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+# macOS resolves both the system temp dir (tempfile.gettempdir()) and /tmp
+# itself to /private/var/folders/.../T via realpath, which the /private/var/
+# prefix above would otherwise blanket-block. That turned every write under
+# the OS-provided temp dir -- including pytest's tmp_path fixture -- into a
+# false-positive "sensitive system path" refusal. Carve out just the per-user
+# variable-data tree macOS mounts there; the rest of /private/var/ (db, root,
+# log, etc.) stays blocked.
+_SENSITIVE_PATH_EXCEPTIONS = (
+    "/private/var/folders/",
+)
+
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
@@ -181,6 +192,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(os.path.expanduser(filepath))
+    for exception in _SENSITIVE_PATH_EXCEPTIONS:
+        if resolved.startswith(exception) or normalized.startswith(exception):
+            return None
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."

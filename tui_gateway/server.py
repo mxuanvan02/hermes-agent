@@ -4977,6 +4977,27 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"type": "alias", "target": qc.get("target", "")})
 
     try:
+        from agent.ecc_commands import (
+            build_ecc_command_message,
+            resolve_ecc_command,
+        )
+
+        ecc_entry = resolve_ecc_command(name)
+        if ecc_entry:
+            message = build_ecc_command_message(name, arg)
+            if message:
+                return _ok(
+                    rid,
+                    {
+                        "type": "skill",
+                        "message": message,
+                        "name": ecc_entry["canonical"],
+                    },
+                )
+    except Exception:
+        pass
+
+    try:
         from hermes_cli.plugins import (
             get_plugin_command_handler,
             resolve_plugin_command_result,
@@ -5899,6 +5920,18 @@ def _(rid, params: dict) -> dict:
     _cmd_parts = _cmd_text.split(maxsplit=1)
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
+
+    try:
+        from agent.ecc_commands import resolve_ecc_command
+
+        if resolve_ecc_command(_cmd_base):
+            return _err(
+                rid,
+                4018,
+                f"ECC command: use command.dispatch for /{_cmd_base}",
+            )
+    except Exception:
+        pass
 
     if _cmd_base in _PENDING_INPUT_COMMANDS:
         return _err(

@@ -1921,6 +1921,35 @@ def looks_like_codex_intermediate_ack(
     return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
 
 
+def looks_like_claude_tool_promise(agent, assistant_content: str) -> bool:
+    """Detect Claude emitting Hermes tool narration without a tool call.
+
+    This deliberately keys on the exact prefix observed in production.  A
+    normal final answer may mention ``Skill/tool:`` later while summarizing
+    completed work; only a response that starts with it is an unfinished
+    action declaration.
+    """
+    if "claude" not in (getattr(agent, "model", "") or "").lower():
+        return False
+    if not getattr(agent, "valid_tool_names", None):
+        return False
+    enforcement = getattr(agent, "_tool_use_enforcement", "auto")
+    if enforcement is False or (
+        isinstance(enforcement, str)
+        and enforcement.lower() in {"false", "never", "no", "off"}
+    ):
+        return False
+    if isinstance(enforcement, list) and not any(
+        isinstance(pattern, str)
+        and pattern.lower() in (getattr(agent, "model", "") or "").lower()
+        for pattern in enforcement
+    ):
+        return False
+
+    text = agent._strip_think_blocks(assistant_content or "").lstrip()
+    return bool(re.match(r"(?i)^skill\s*/\s*tool\s*:", text))
+
+
 
 
 def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
@@ -2357,6 +2386,7 @@ __all__ = [
     "repair_tool_call",
     "sanitize_api_messages",
     "looks_like_codex_intermediate_ack",
+    "looks_like_claude_tool_promise",
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",
     "extract_api_error_context",

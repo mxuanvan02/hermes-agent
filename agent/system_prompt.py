@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    CLAUDE_TOOL_USE_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -140,17 +141,30 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.valid_tool_names:
         _enforce = agent._tool_use_enforcement
         _inject = False
+        model_lower = (agent.model or "").lower()
         if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
             _inject = True
         elif _enforce is False or (isinstance(_enforce, str) and _enforce.lower() in {"false", "never", "no", "off"}):
             _inject = False
         elif isinstance(_enforce, list):
-            model_lower = (agent.model or "").lower()
             _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
         else:
             # "auto" or any unrecognised value — use hardcoded defaults
-            model_lower = (agent.model or "").lower()
             _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+
+        # Claude gets a narrow family-specific rule in auto mode.  Keep the
+        # generic enforcement block off unless explicitly configured, since
+        # its wording was tuned for other model families.
+        _disabled = _enforce is False or (
+            isinstance(_enforce, str)
+            and _enforce.lower() in {"false", "never", "no", "off"}
+        )
+        _custom_list_allows = not isinstance(_enforce, list) or any(
+            isinstance(p, str) and p.lower() in model_lower for p in _enforce
+        )
+        if "claude" in model_lower and not _disabled and _custom_list_allows:
+            stable_parts.append(CLAUDE_TOOL_USE_GUIDANCE)
+
         if _inject:
             stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()

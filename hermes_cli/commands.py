@@ -248,6 +248,114 @@ def resolve_command(name: str) -> CommandDef | None:
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
 
 
+def suggest_commands(name: str, limit: int = 5) -> list[str]:
+    """Return real slash-command names close to an unrecognized command.
+
+    Suggestions never dispatch automatically. Canonical names are returned even
+    when an alias matched, and dynamic ECC, plugin, and skill catalogs are
+    included so hidden Telegram menu entries remain discoverable.
+    """
+    from difflib import SequenceMatcher
+
+    query = name.strip().lower().lstrip("/").replace("-", "_")
+    if not query or limit <= 0:
+        return []
+
+    # Every key must itself be dispatchable, so a suggestion the user types
+    # back always resolves. ECC slugs are matchable but not dispatchable on
+    # their own, so they are not offered as display names.
+    candidates: dict[str, list[tuple[str, bool]]] = {}
+
+    def add(display: str, *aliases: str, alias_dispatchable: bool = True) -> None:
+        display = _sanitize_telegram_name(display)
+        if not display:
+            return
+        keys = candidates.setdefault(display, [(display, True)])
+        for alias in aliases:
+            normalized = _sanitize_telegram_name(alias)
+            if normalized and normalized != display:
+                keys.append((normalized, alias_dispatchable))
+
+    overrides = _resolve_config_gates()
+    for cmd in COMMAND_REGISTRY:
+        if _is_gateway_available(cmd, overrides):
+            add(cmd.name, *cmd.aliases)
+
+    try:
+        from agent.ecc_commands import get_ecc_commands
+
+        for entry in get_ecc_commands().values():
+            # ``/ecc_<slug>`` dispatches; the bare slug only helps matching.
+            add(
+                str(entry["telegram_name"]),
+                str(entry["slug"]),
+                alias_dispatchable=False,
+            )
+    except Exception:
+        pass
+
+    for plugin_name, _description, _args_hint in _iter_plugin_command_entries():
+        add(plugin_name)
+
+    try:
+        from agent.skill_commands import get_skill_commands
+
+        for command_key in get_skill_commands():
+            add(command_key.lstrip("/"))
+    except Exception:
+        pass
+
+    def score_key(key: str) -> tuple[int, float]:
+        """Rank one candidate key against the query (lower tier = better)."""
+        if key == query:
+            return 0, 1.0
+        if key.startswith(query):
+            return 1, len(query) / len(key)
+        # Word-boundary hit ranks above a match buried mid-word, so "sec"
+        # prefers /ecc_security_scan over an incidental "…sec…" elsewhere.
+        if any(segment.startswith(query) for segment in key.split("_")):
+            return 2, len(query) / len(key)
+        if query in key:
+            return 3, len(query) / len(key)
+        # Subsequence: every typed character appears in order ("brnst" →
+        # "brainstorm"). This is what makes heavily abbreviated input work.
+        position = 0
+        for char in query:
+            position = key.find(char, position) + 1
+            if position == 0:
+                break
+        else:
+            return 4, len(query) / len(key)
+        return 5, SequenceMatcher(None, query, key).ratio()
+
+    ranked: list[tuple[int, float, int, str]] = []
+    for display, keys in candidates.items():
+        best: tuple[int, float, str] | None = None
+        for key, dispatchable in keys:
+            tier, score = score_key(key)
+            label = key if dispatchable else display
+            if best is None or (tier, -score) < (best[0], -best[1]):
+                best = (tier, score, label)
+        if best is None:
+            continue
+        tier, score, label = best
+        # Fuzzy ratios need a floor; the structural tiers are already precise.
+        if tier == 5 and score < 0.55:
+            continue
+        ranked.append((tier, -score, len(label), label))
+
+    ranked.sort()
+    seen: set[str] = set()
+    result: list[str] = []
+    for _tier, _score, _length, label in ranked:
+        if label not in seen:
+            seen.add(label)
+            result.append(label)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _build_description(cmd: CommandDef) -> str:
     """Build a CLI-facing description string including usage hint."""
     if cmd.args_hint:
@@ -476,6 +584,16 @@ def _iter_plugin_command_entries() -> list[tuple[str, str, str]]:
     return entries
 
 
+def _iter_ecc_menu_entries() -> list[tuple[str, str]]:
+    """Return Telegram-safe aliases for the dynamic ECC command catalog."""
+    try:
+        from agent.ecc_commands import ecc_telegram_menu_entries
+
+        return list(ecc_telegram_menu_entries())
+    except Exception:
+        return []
+
+
 def telegram_bot_commands() -> list[tuple[str, str]]:
     """Return (command_name, description) pairs for Telegram setMyCommands.
 
@@ -567,6 +685,66 @@ def _prioritize_telegram_menu_commands(
             else (
                 1,
                 item[0],
+            ),
+        )
+    ]
+
+
+_ECC_MENU_PRIORITY = (
+    # Manuscript / peer-review workflows lead: they wrap the academic-paper,
+    # academic-pipeline and academic-paper-reviewer skills, which are the
+    # highest-frequency entry points for research work on this install.
+    "ecc_paper",
+    "ecc_manuscript",
+    "ecc_peer_review",
+    "ecc_revision",
+    "ecc_pipeline",
+    # Research / knowledge workflows next — the reason this ordering exists.
+    "ecc_plan",
+    "ecc_plan_prd",
+    "ecc_plan_canvas",
+    "ecc_learn",
+    "ecc_learn_eval",
+    "ecc_evolve",
+    "ecc_projects",
+    "ecc_checkpoint",
+    "ecc_save_session",
+    "ecc_resume_session",
+    "ecc_sessions",
+    "ecc_cost_report",
+    "ecc_ecc_guide",
+    # Language-agnostic quality workflows.
+    "ecc_code_review",
+    "ecc_test_coverage",
+    "ecc_security_scan",
+    "ecc_quality_gate",
+    "ecc_refactor_clean",
+    "ecc_update_docs",
+    "ecc_pr",
+    "ecc_review_pr",
+)
+"""ECC workflows that keep their Telegram menu slot ahead of the rest.
+
+The catalog is ~94 workflows and mostly per-language build/review/test
+variants (``ecc_cpp_test``, ``ecc_vue_review``, …).  Those stay dispatchable
+by typing but must not outrank research and cross-language workflows for the
+handful of menu slots left after the core built-ins.
+"""
+
+
+def _prioritize_ecc_menu_commands(
+    commands: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Order ECC entries: curated research/quality set first, then alphabetical."""
+    priority = {name: index for index, name in enumerate(_ECC_MENU_PRIORITY)}
+    return [
+        command
+        for _index, command in sorted(
+            enumerate(commands),
+            key=lambda item: (
+                (0, priority[item[1][0]], item[0])
+                if item[1][0] in priority
+                else (1, 0, item[0])
             ),
         )
     ]
@@ -788,6 +966,23 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         commands omitted due to the cap.
     """
     core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
+    ecc_commands = _iter_ecc_menu_entries()
+
+    # Telegram exposes at most 100 entries. Core built-ins win every slot they
+    # need first: an operator who cannot reach /resume, /approve or /restart
+    # from the menu is worse off than one who has to type a rare ECC workflow
+    # by hand. ECC fills whatever is left, curated set first, and the whole
+    # 94-workflow catalog stays dispatchable when typed.
+    if ecc_commands:
+        reserved = {name for name, _ in core_commands}
+        ecc_commands = _prioritize_ecc_menu_commands(ecc_commands)
+        ecc_commands = _clamp_command_names(ecc_commands, reserved)
+        ecc_commands = [(n, d) for n, d, *_ in ecc_commands if n not in reserved]
+        ecc_slots = max(0, max_commands - len(core_commands))
+        hidden = max(0, len(ecc_commands) - ecc_slots)
+        all_commands = core_commands + ecc_commands[:ecc_slots]
+        return all_commands[:max_commands], hidden
+
     reserved_names = {n for n, _ in core_commands}
     all_commands = list(core_commands)
     hidden_core_count = max(0, len(all_commands) - max_commands)

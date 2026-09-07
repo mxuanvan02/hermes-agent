@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent.prompt_builder import (
+    CLAUDE_TOOL_USE_GUIDANCE,
     _scan_context_content,
     _truncate_content,
     _parse_skill_file,
@@ -1153,6 +1154,11 @@ class TestToolUseEnforcementGuidance:
     def test_enforcement_models_is_tuple(self):
         assert isinstance(TOOL_USE_ENFORCEMENT_MODELS, tuple)
 
+    def test_claude_guidance_targets_text_only_skill_tool_narration(self):
+        text = CLAUDE_TOOL_USE_GUIDANCE.lower()
+        assert "skill/tool:" in text
+        assert "structured tool call" in text
+
 
 class TestOpenAIModelExecutionGuidance:
     """Tests for GPT/Codex-specific execution discipline guidance."""
@@ -1192,6 +1198,5 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
 

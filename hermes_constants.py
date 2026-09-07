@@ -286,11 +286,18 @@ def get_subprocess_home() -> str | None:
     * **Profile isolation** — each profile gets its own git identity, SSH
       keys, gh tokens, etc.
 
+    Set ``HERMES_DISABLE_SUBPROCESS_HOME`` to a truthy value (``1``, ``true``,
+    ``yes``, or ``on``) to keep the operating-system user's HOME instead.
+
     The Python process's own ``os.environ["HOME"]`` and ``Path.home()`` are
     **never** modified — only subprocess environments should inject this value.
     Activation is directory-based: if the ``home/`` subdirectory doesn't
     exist, returns ``None`` and behavior is unchanged.
     """
+    disable_override = os.getenv("HERMES_DISABLE_SUBPROCESS_HOME", "").strip().lower()
+    if disable_override in {"1", "true", "yes", "on"}:
+        return None
+
     hermes_home = get_hermes_home_override() or os.getenv("HERMES_HOME")
     if not hermes_home:
         return None

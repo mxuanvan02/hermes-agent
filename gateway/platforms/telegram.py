@@ -105,7 +105,9 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 }
 
 
-MAX_COMMANDS_PER_SCOPE = 30
+# Telegram accepts at most 100 bot commands per scope. Keep the full ECC
+# catalog visible in the menu while preserving the documented API limit.
+MAX_COMMANDS_PER_SCOPE = 100
 
 
 def check_telegram_requirements() -> bool:
@@ -2071,9 +2073,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeChat,
                 )
                 from hermes_cli.commands import telegram_menu_commands
-                # Telegram allows up to 100 commands but has an undocumented
-                # payload size limit (~4KB total).  Limit to 30 core commands
-                # to stay well under the threshold while covering all categories.
+                # Telegram allows up to 100 commands (MAX_COMMANDS_PER_SCOPE)
+                # but has an undocumented payload size limit (~4KB total).
+                # Core built-ins claim their slots first; the ECC workflow
+                # catalog fills whatever is left, so hidden_count counts
+                # ECC workflows omitted from the menu — all of them stay
+                # dispatchable when typed by hand.
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
@@ -2092,8 +2097,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # message from a forum topic (see _handle_text_message).
                 if hidden_count:
                     logger.info(
-                        "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
-                        self.name, len(menu_commands), hidden_count, 30,
+                        "[%s] Telegram menu: %d commands registered, %d ECC workflows hidden (over %d limit). Use /commands for full list.",
+                        self.name, len(menu_commands), hidden_count, MAX_COMMANDS_PER_SCOPE,
                     )
             except Exception as e:
                 logger.warning(
